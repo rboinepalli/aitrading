@@ -1,171 +1,76 @@
 """
-signals/entry.py — Entry signal generation.
+signals/entry.py — Time window gating for entries.
 
-Combines regime + technical indicators to decide: BUY or NONE.
+v2 responsibility: determine WHICH time window we're in and return
+the minimum conviction score required. The actual scoring happens
+in strategies/strategy_a.py and strategies/strategy_b.py.
 
-Entry rules:
-  BULL regime  → check TQQQ:
-    - RSI < rsi_oversold (price dipped, potential bounce)
-    - EMA fast just crossed ABOVE EMA slow (momentum turning up)
-    - Both must be true → BUY TQQQ
+Time windows (ET):
+  9:30–11:00am  PRIMARY     → min score 5/8 — strongest signals, most volume
+  11:00am–2pm   DEAD ZONE   → NO ENTRIES — markets are choppy mid-day
+  2pm–3:30pm    POWER HOUR  → min score 6/8 — second window, stricter bar
+  After 3:30pm  NO ENTRY    → too close to hard close at 3:45pm
 
-  BEAR regime  → check SQQQ:
-    - RSI > rsi_overbought on the UNDERLYING (or use SQQQ's own RSI inversely)
-    - EMA fast just crossed BELOW EMA slow on SQQQ (momentum turning up for the bear ETF)
-    - Both must be true → BUY SQQQ
-
-  CHOPPY → NONE — don't trade in directionless markets
-
-Why require BOTH RSI AND EMA crossover?
-  Using two independent indicators reduces false signals.
-  RSI alone generates too many "bounce" signals that fizzle.
-  The EMA crossover confirms that momentum has actually shifted.
-  Requiring both filters out a lot of noise. This is called signal confluence.
+Why avoid 11am–2pm?
+  Studies consistently show intraday volume and directional momentum are
+  weakest between 11am and 2pm. This is when algo strategies produce the
+  most false signals — high noise, low signal. Sitting out costs very few
+  profitable trades and avoids a lot of losers.
 """
 
 import logging
-from dataclasses import dataclass
+from datetime import datetime, time
 from enum import Enum
 
-from config import Config
-from signals.indicators import fetch_indicators, ema_crossed_above, ema_crossed_below
-from signals.regime import Regime
+import pytz
 
+ET = pytz.timezone("America/New_York")
 logger = logging.getLogger(__name__)
 
 
-class Signal(str, Enum):
+class TimeWindow(str, Enum):
     """
-    Entry signal values.
-    TypeScript analogy: `type Signal = 'BUY' | 'NONE'`
+    Which time window is active right now.
+    TypeScript analogy: `type TimeWindow = 'PRIMARY' | 'DEAD_ZONE' | 'POWER_HOUR' | 'CLOSED'`
     """
-    BUY = "BUY"
-    NONE = "NONE"
+    PRIMARY = "PRIMARY"         # 9:30–11:00am, min score 5
+    DEAD_ZONE = "DEAD_ZONE"     # 11am–2pm, no entries
+    POWER_HOUR = "POWER_HOUR"   # 2pm–3:30pm, min score 6
+    CLOSED = "CLOSED"           # before open or after 3:30pm
 
 
-@dataclass
-class EntrySignal:
-    """Full signal result — includes the signal value and context for logging/storage."""
-    signal: Signal
-    ticker: str             # which ticker to buy (or evaluated)
-    regime: Regime
-    rsi: float
-    ema_fast: float
-    ema_slow: float
-    vix: float
-    price: float
-    reason: str             # human-readable explanation of why we did/didn't signal
-
-
-def evaluate_entry(regime: Regime, vix: float, cfg: Config) -> EntrySignal:
+def get_time_window(cfg) -> tuple[TimeWindow, int]:
     """
-    Evaluate whether to enter a trade given the current regime.
-
-    Args:
-        regime: Current market regime (BULL/BEAR/CHOPPY)
-        vix:    Current VIX value (passed in to avoid a second fetch)
-        cfg:    Bot configuration (thresholds, tickers)
+    Return the current time window and the minimum conviction score required.
 
     Returns:
-        EntrySignal with signal=BUY or signal=NONE
+        (TimeWindow, min_score)
+        min_score is 0 for DEAD_ZONE and CLOSED — signals not to enter.
     """
-    # CHOPPY → always sit out
-    if regime == Regime.CHOPPY:
-        return EntrySignal(
-            signal=Signal.NONE,
-            ticker="N/A",
-            regime=regime,
-            rsi=0.0, ema_fast=0.0, ema_slow=0.0,
-            vix=vix, price=0.0,
-            reason="CHOPPY regime — no trades",
-        )
+    now = datetime.now(ET).time()
 
-    # Choose which ticker to evaluate based on regime
-    ticker = cfg.bull_ticker if regime == Regime.BULL else cfg.bear_ticker
+    entry_start = _t(cfg.entry_window_start)    # 09:30
+    entry_end = _t(cfg.entry_window_end)         # 11:00
+    dead_end = _t(cfg.dead_zone_end)             # 14:00
+    power_cutoff = _t(cfg.power_hour_entry_cutoff)  # 15:30
 
-    # Fetch the latest RSI + EMA values for that ticker
-    snap = fetch_indicators(
-        ticker=ticker,
-        rsi_period=cfg.rsi_period,
-        ema_fast=cfg.ema_fast,
-        ema_slow=cfg.ema_slow,
-    )
+    if now < entry_start:
+        return TimeWindow.CLOSED, 0
 
-    if snap is None:
-        return EntrySignal(
-            signal=Signal.NONE,
-            ticker=ticker,
-            regime=regime,
-            rsi=0.0, ema_fast=0.0, ema_slow=0.0,
-            vix=vix, price=0.0,
-            reason="Indicator fetch failed — skipping",
-        )
+    if entry_start <= now < entry_end:
+        return TimeWindow.PRIMARY, 5   # or cfg.strategy_a.primary_min_score
 
-    # -----------------------------------------------------------------------
-    # BULL entry: RSI oversold + fast EMA crossed above slow EMA
-    # -----------------------------------------------------------------------
-    if regime == Regime.BULL:
-        rsi_ok = snap.rsi < cfg.rsi_oversold
-        crossover_ok = ema_crossed_above(snap)
+    if entry_end <= now < dead_end:
+        return TimeWindow.DEAD_ZONE, 0
 
-        if rsi_ok and crossover_ok:
-            reason = f"RSI={snap.rsi:.1f} < {cfg.rsi_oversold} AND EMA crossover up"
-            return _buy_signal(snap, regime, vix, reason)
-        else:
-            parts = []
-            if not rsi_ok:
-                parts.append(f"RSI={snap.rsi:.1f} not oversold (<{cfg.rsi_oversold})")
-            if not crossover_ok:
-                parts.append("no EMA crossover")
-            return _no_signal(snap, regime, vix, " | ".join(parts))
+    if dead_end <= now < power_cutoff:
+        return TimeWindow.POWER_HOUR, 6  # stricter
 
-    # -----------------------------------------------------------------------
-    # BEAR entry: fast EMA crossed below slow EMA on SQQQ
-    # (SQQQ goes UP when the market goes DOWN, so EMA crossover logic is the
-    # same as for a bull ETF — we want SQQQ's own upward momentum)
-    # -----------------------------------------------------------------------
-    if regime == Regime.BEAR:
-        crossover_ok = ema_crossed_above(snap)   # SQQQ trending up
-
-        if crossover_ok:
-            reason = f"BEAR regime EMA crossover up on {ticker}"
-            return _buy_signal(snap, regime, vix, reason)
-        else:
-            return _no_signal(snap, regime, vix, "no EMA crossover on SQQQ")
-
-    # Fallback (shouldn't reach here)
-    return _no_signal(snap, regime, vix, "unhandled regime")
+    # After 3:30pm — no new entries (exits still run)
+    return TimeWindow.CLOSED, 0
 
 
-# ---------------------------------------------------------------------------
-# Private helpers — named with leading _ by Python convention (like private in TS)
-# ---------------------------------------------------------------------------
-
-def _buy_signal(snap, regime, vix, reason) -> EntrySignal:
-    logger.info("BUY SIGNAL — %s | %s", snap.ticker, reason)
-    return EntrySignal(
-        signal=Signal.BUY,
-        ticker=snap.ticker,
-        regime=regime,
-        rsi=snap.rsi,
-        ema_fast=snap.ema_fast,
-        ema_slow=snap.ema_slow,
-        vix=vix,
-        price=snap.price,
-        reason=reason,
-    )
-
-
-def _no_signal(snap, regime, vix, reason) -> EntrySignal:
-    logger.debug("No signal — %s | %s", snap.ticker, reason)
-    return EntrySignal(
-        signal=Signal.NONE,
-        ticker=snap.ticker,
-        regime=regime,
-        rsi=snap.rsi,
-        ema_fast=snap.ema_fast,
-        ema_slow=snap.ema_slow,
-        vix=vix,
-        price=snap.price,
-        reason=reason,
-    )
+def _t(hhmm: str) -> time:
+    """Parse "HH:MM" string into a time object."""
+    h, m = hhmm.split(":")
+    return time(int(h), int(m))

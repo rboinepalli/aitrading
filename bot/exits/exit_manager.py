@@ -1,117 +1,146 @@
 """
-exits/exit_manager.py — Position exit logic.
+exits/exit_manager.py — Position exit logic with partial exits.
 
-Three exit conditions, checked in priority order:
-  1. Take profit  → unrealized gain >= +15%  (lock in the win)
-  2. Stop loss    → unrealized loss <= -10%  (cut the loss)
-  3. EOD close    → current time >= 3:45pm ET (exit before market close)
+v2 adds PARTIAL EXIT logic:
+  - Sell 50% of shares when gain hits the partial_exit_pct threshold
+  - Move stop loss to breakeven (entry price) after partial exit
+  - Let the remaining 50% run to the full take_profit_pct target
 
-Why a hard EOD close?
-  Leveraged ETFs (TQQQ, SQQQ) use daily rebalancing and decay over time when held
-  overnight. Closing by 3:45pm gives 15 minutes of buffer before the 4pm close
-  and avoids overnight decay risk in v1 (swing trades come in v2).
+Example (Strategy A):
+  Entry: 100 shares TQQQ @ $50 = $5,000
+  At +8%: sell 50 shares @ $54 → locks in +$200 profit
+          stop moves to $50 (breakeven on remaining 50 shares)
+  At +15%: sell remaining 50 shares @ $57.50 → locks in +$375
+  Total realized: +$575 instead of risking full position
 
-Why these specific percentages?
-  +15% / -10% gives a 1.5:1 reward-to-risk ratio, which is a common minimum
-  threshold for viable trading strategies. On a 3x leveraged ETF like TQQQ,
-  a +15% gain means the underlying QQQ only moved +5%.
+  vs. simple exit at +15%:
+  If price hits +8% then reverses to -5%, with partial exit you still
+  made money. With no partial exit you'd lose $250.
+
+ExitReason values:
+  PARTIAL_PROFIT  → first partial exit (50% sold, trade stays open)
+  TAKE_PROFIT     → full take profit (remaining 50% sold)
+  STOP_LOSS       → full stop loss (all remaining sold)
+  EOD_CLOSE       → forced close at 3:45pm
+  NONE            → no exit triggered
 """
 
 import logging
 from dataclasses import dataclass
-from enum import Enum
 from datetime import datetime, time
+from enum import Enum
 
 import pytz
 
 from broker.alpaca_client import OpenPosition
-from config import Config
+from config import Config, StrategyConfig
 
 logger = logging.getLogger(__name__)
-
-ET = pytz.timezone("America/New_York")  # all market logic runs in Eastern Time
+ET = pytz.timezone("America/New_York")
 
 
 class ExitReason(str, Enum):
-    """
-    Why we're closing a position.
-    Stored in the trades table exit_reason column.
-    """
-    TAKE_PROFIT = "TAKE_PROFIT"
-    STOP_LOSS = "STOP_LOSS"
-    EOD_CLOSE = "EOD_CLOSE"
-    NONE = "NONE"   # no exit triggered
+    PARTIAL_PROFIT = "PARTIAL_PROFIT"   # sold 50%, trade still open
+    TAKE_PROFIT = "TAKE_PROFIT"         # sold remaining, trade closed
+    STOP_LOSS = "STOP_LOSS"             # stop hit, trade closed
+    EOD_CLOSE = "EOD_CLOSE"             # hard close at 3:45pm
+    NONE = "NONE"
 
 
 @dataclass
 class ExitDecision:
-    """Result of checking whether to exit a position."""
-    should_exit: bool
+    should_exit: bool       # True = execute a sell order
+    exit_all: bool          # True = close full position; False = sell 50% (partial)
     reason: ExitReason
-    detail: str     # human-readable explanation (useful for logs + Telegram in v2)
+    detail: str
 
 
-def check_exit(position: OpenPosition, cfg: Config) -> ExitDecision:
+def check_exit(
+    position: OpenPosition,
+    strategy: StrategyConfig,
+    partial_already_triggered: bool,
+    stop_price: float | None,          # None = use strategy default; entry_price after partial
+    force_close_time: str,
+) -> ExitDecision:
     """
     Evaluate all exit conditions for an open position.
 
     Args:
-        position: The current open position from Alpaca
-        cfg:      Bot configuration (thresholds, EOD time)
+        position:                  Current open position from Alpaca
+        strategy:                  Strategy config (take_profit, stop_loss thresholds)
+        partial_already_triggered: True if we already sold 50% earlier
+        stop_price:                Dynamic stop (moves to breakeven after partial exit)
+        force_close_time:          "HH:MM" hard close time (e.g. "15:45")
 
     Returns:
-        ExitDecision — includes whether to exit and the reason why.
+        ExitDecision
     """
-    # 1. Take profit — unrealized P&L is already a decimal from Alpaca
-    if position.unrealized_pnl_pct >= cfg.take_profit_pct:
+    pnl_pct = position.unrealized_pnl_pct  # e.g. 0.08 = +8%
+
+    # Determine effective stop — if partial exit already happened,
+    # stop is at breakeven (entry_price). Otherwise use strategy's stop_loss_pct.
+    if partial_already_triggered and stop_price is not None:
+        effective_stop = (stop_price - position.entry_price) / position.entry_price
+    else:
+        effective_stop = -strategy.stop_loss_pct  # e.g. -0.10
+
+    # 1. Partial exit — only if not already triggered
+    if not partial_already_triggered and pnl_pct >= strategy.partial_exit_pct:
         return ExitDecision(
             should_exit=True,
+            exit_all=False,    # sell only 50%
+            reason=ExitReason.PARTIAL_PROFIT,
+            detail=(
+                f"Partial exit: +{pnl_pct:.1%} hit {strategy.partial_exit_pct:.0%} target. "
+                f"Selling 50%, moving stop to breakeven."
+            ),
+        )
+
+    # 2. Full take profit (second half)
+    if partial_already_triggered and pnl_pct >= strategy.take_profit_pct:
+        return ExitDecision(
+            should_exit=True,
+            exit_all=True,
             reason=ExitReason.TAKE_PROFIT,
-            detail=(
-                f"Take profit hit: +{position.unrealized_pnl_pct:.1%} "
-                f"(${position.unrealized_pnl:.2f})"
-            ),
+            detail=f"Take profit: +{pnl_pct:.1%} (${position.unrealized_pnl:.2f})",
         )
 
-    # 2. Stop loss — pnl_pct is negative for losses
-    if position.unrealized_pnl_pct <= -cfg.stop_loss_pct:
+    # 3. Stop loss (or breakeven stop after partial)
+    if pnl_pct <= effective_stop:
+        stop_label = "Breakeven stop" if partial_already_triggered else "Stop loss"
         return ExitDecision(
             should_exit=True,
+            exit_all=True,
             reason=ExitReason.STOP_LOSS,
-            detail=(
-                f"Stop loss hit: {position.unrealized_pnl_pct:.1%} "
-                f"(${position.unrealized_pnl:.2f})"
-            ),
+            detail=f"{stop_label}: {pnl_pct:.1%} (${position.unrealized_pnl:.2f})",
         )
 
-    # 3. EOD hard close — check the wall clock in ET
-    now_et = datetime.now(ET)
-    eod_time = _parse_time(cfg.eod_close_time)
-
-    if now_et.time() >= eod_time:
+    # 4. EOD hard close
+    now_et = datetime.now(ET).time()
+    eod = _parse_time(force_close_time)
+    if now_et >= eod:
         return ExitDecision(
             should_exit=True,
+            exit_all=True,
             reason=ExitReason.EOD_CLOSE,
-            detail=f"EOD hard close at {now_et.strftime('%H:%M')} ET",
+            detail=f"Hard close at {force_close_time} ET",
         )
 
-    # No exit triggered
+    # No exit
+    stop_display = f"{effective_stop:.1%}"
     return ExitDecision(
         should_exit=False,
+        exit_all=False,
         reason=ExitReason.NONE,
         detail=(
-            f"Holding: {position.unrealized_pnl_pct:.1%} | "
-            f"TP={cfg.take_profit_pct:.0%} SL=-{cfg.stop_loss_pct:.0%}"
+            f"Holding {position.ticker}: {pnl_pct:+.1%} | "
+            f"TP={strategy.take_profit_pct:.0%} "
+            f"partial={strategy.partial_exit_pct:.0%} "
+            f"SL={stop_display}"
         ),
     )
 
 
 def _parse_time(hhmm: str) -> time:
-    """
-    Convert a "HH:MM" string to a datetime.time object.
-    e.g. "15:45" → time(15, 45)
-
-    TypeScript analogy: parsing a time string into a comparable value.
-    """
-    parts = hhmm.split(":")
-    return time(int(parts[0]), int(parts[1]))
+    h, m = hhmm.split(":")
+    return time(int(h), int(m))

@@ -21,15 +21,20 @@ import { supabase } from '../lib/supabase'
 // Nullable fields (exit_*, pnl) are null while the trade is open.
 export interface Trade {
   id: string
+  strategy: string | null         // aggressive_3x | conservative_multi
   ticker: string
   entry_price: number
   exit_price: number | null
   shares: number
-  entry_time: string       // ISO 8601 datetime string
+  entry_time: string
   exit_time: string | null
-  exit_reason: string | null  // TAKE_PROFIT | STOP_LOSS | EOD_CLOSE
+  exit_reason: string | null      // TAKE_PROFIT | PARTIAL_PROFIT | STOP_LOSS | EOD_CLOSE
   pnl: number | null
-  regime: string           // BULL | BEAR | CHOPPY
+  regime: string
+  conviction_score: number | null
+  signals_triggered: string[] | null
+  status: string | null           // OPEN | CLOSED_GAIN | CLOSED_LOSS
+  partial_exit_triggered: boolean | null
   created_at: string
 }
 
