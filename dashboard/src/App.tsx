@@ -11,6 +11,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { BotStatus } from './components/BotStatus'
 import { StrategyCard } from './components/StrategyCard'
 import { TradeLog } from './components/TradeLog'
+import { BacktestPanel } from './components/BacktestPanel'
 
 const queryClient = new QueryClient()
 
@@ -47,6 +48,12 @@ function Dashboard() {
 
         {/* Trade log — all strategies */}
         <TradeLog />
+
+        {/* Backtest results */}
+        <section>
+          <h2 className="text-base font-semibold text-gray-700 mb-3">Backtest Results</h2>
+          <BacktestPanel />
+        </section>
       </main>
     </div>
   )
