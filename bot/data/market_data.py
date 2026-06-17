@@ -24,6 +24,7 @@ from typing import Optional
 
 import pandas as pd
 import requests
+from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -151,6 +152,7 @@ class MarketDataClient:
                 timeframe=TimeFrame.Day,
                 start=start,
                 end=end,
+                feed=DataFeed.IEX,   # free tier — paper accounts use IEX, not SIP
             ))
             return _normalise(bars.df, ticker)
         except Exception as exc:
@@ -172,6 +174,7 @@ class MarketDataClient:
                 timeframe=TimeFrame(5, TimeFrameUnit.Minute),
                 start=start,
                 end=end,
+                feed=DataFeed.IEX,   # free tier
             ))
             return _normalise(bars.df, ticker)
         except Exception as exc:
