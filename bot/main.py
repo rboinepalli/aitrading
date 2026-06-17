@@ -233,10 +233,11 @@ def run_loop() -> None:
     """Called every 5 minutes by APScheduler during market hours."""
     now_et = datetime.now(ET)
 
-    # Check time window first — skip everything during dead zone and after close
+    # Skip API calls during dead zone — no entries, no open positions to manage.
+    # Never skip CLOSED: that's when the 3:45pm EOD force-close must run.
     window, min_score = get_time_window(_cfg)
-    if window in (TimeWindow.DEAD_ZONE, TimeWindow.CLOSED):
-        logger.info("=== Skipping tick: %s ET — window=%s ===", now_et.strftime("%H:%M"), window.value)
+    if window == TimeWindow.DEAD_ZONE:
+        logger.info("=== Skipping tick: %s ET — DEAD_ZONE ===", now_et.strftime("%H:%M"))
         return
 
     logger.info("=== Loop tick: %s ET ===", now_et.strftime("%Y-%m-%d %H:%M"))
