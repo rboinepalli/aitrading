@@ -232,6 +232,13 @@ def _run_strategy(
 def run_loop() -> None:
     """Called every 5 minutes by APScheduler during market hours."""
     now_et = datetime.now(ET)
+
+    # Check time window first — skip everything during dead zone and after close
+    window, min_score = get_time_window(_cfg)
+    if window in (TimeWindow.DEAD_ZONE, TimeWindow.CLOSED):
+        logger.info("=== Skipping tick: %s ET — window=%s ===", now_et.strftime("%H:%M"), window.value)
+        return
+
     logger.info("=== Loop tick: %s ET ===", now_et.strftime("%Y-%m-%d %H:%M"))
 
     # 1. Detect regime (once per tick, shared by both strategies)
@@ -242,8 +249,7 @@ def run_loop() -> None:
         _db.log_event("ERROR", f"Regime detection failed: {e}")
         return
 
-    # 2. Determine time window
-    window, min_score = get_time_window(_cfg)
+    # 2. Log window + regime
     logger.info(
         "Window=%s min_score=%d | Regime=%s | SPY=%.2f SMA200=%.2f | VIXY=%.2f",
         window.value, min_score, regime.value, spy_price, spy_sma, vixy_price,
