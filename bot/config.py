@@ -62,10 +62,6 @@ class Config:
     supabase_url: str
     supabase_service_key: str
 
-    # Regime detection
-    vix_bear_threshold: float
-    vix_bull_threshold: float
-
     # Shared risk
     max_per_trade_usd: float    # max $ for any single trade across both strategies
     max_daily_loss_usd: float   # per-strategy daily loss limit
@@ -132,9 +128,6 @@ def load_config() -> Config:
 
         supabase_url=_require("SUPABASE_URL"),
         supabase_service_key=_require("SUPABASE_SERVICE_KEY"),
-
-        vix_bear_threshold=_float("VIX_BEAR_THRESHOLD", 25.0),
-        vix_bull_threshold=_float("VIX_BULL_THRESHOLD", 18.0),
 
         max_per_trade_usd=_float("MAX_PER_TRADE_USD", 2_000),
         max_daily_loss_usd=_float("MAX_DAILY_LOSS_USD", 500),

@@ -1,37 +1,34 @@
 """
-data/market_data.py — Unified market data layer.
+data/market_data.py — Unified market data layer using Alpaca Data API.
 
-Data sources:
-  VIX    → CBOE public CSV (no auth, CDN, no rate limits)
-             https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv
-             Fetched once per day, cached in memory for all ticks.
-             Gives the previous day's VIX close — stable for regime classification.
+All data comes from Alpaca (authenticated, IEX feed, no rate limits):
+  - SPY daily bars    → 200-DMA for regime direction
+  - Stock 5-min bars  → RSI, EMA, MACD, VWAP, volume for conviction scoring
+  - VIXY latest bar   → VIX proxy, logged to Supabase for auditing only
+                        (does NOT gate trades — conviction scoring handles quality)
 
-  Stocks → Alpaca Data API (authenticated, no IP-based rate limits)
-             Same credentials as our trading account — no extra cost or setup.
-             Replaces yfinance which rate-limits aggressively on cloud servers.
+Why not VIX as a gate?
+  The CBOE CSV only has yesterday's VIX — stale for intraday decisions.
+  VIXY (VIX futures ETF) is real-time but its price decays over time and
+  doesn't map cleanly to VIX levels. More importantly, conviction scoring
+  (5/8 signals: RSI, MACD, VWAP, volume...) already measures market quality
+  directly on the ticker we want to trade — that's a better filter than VIX.
 
-Why not yfinance?
-  Yahoo Finance throttles requests from cloud IPs (Railway, AWS, GCP) far more
-  aggressively than home IPs. The error YFRateLimitError appears on nearly every
-  tick when deployed on shared hosting. Switching to authenticated sources
-  eliminates this entirely.
+  Regime direction comes from SPY 200-DMA (BULL / BEAR).
+  Trade quality comes from conviction score (must be ≥ 5 or 6).
+  VIXY is logged alongside every signal for post-trade audit only.
 """
 
 import logging
-from datetime import datetime, timezone, timedelta, date
-from typing import Optional
+from datetime import datetime, timezone, timedelta
 
 import pandas as pd
-import requests
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestBarRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 logger = logging.getLogger(__name__)
-
-CBOE_VIX_CSV_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
 
 # Alpaca column names → Title Case we use everywhere in indicator math
 _COL_MAP = {
@@ -76,62 +73,36 @@ class MarketDataClient:
             api_key=api_key,
             secret_key=secret_key,
         )
-        # VIX cache: fetched once per trading day, reused for all ticks.
-        # TypeScript analogy: { date: string | null; value: number | null }
-        self._vix_cache_date: Optional[date] = None
-        self._vix_cache_value: Optional[float] = None
-        logger.info("MarketDataClient (Alpaca + CBOE) initialised")
+        logger.info("MarketDataClient (Alpaca IEX) initialised")
 
     # -----------------------------------------------------------------------
-    # VIX — CBOE public CSV
+    # VIXY — real-time VIX proxy for audit logging (does NOT gate trades)
     # -----------------------------------------------------------------------
 
-    def fetch_vix(self) -> float:
+    def fetch_vixy_price(self) -> float:
         """
-        Fetch the latest VIX close from CBOE's public VIX history CSV.
+        Fetch the latest VIXY bar close from Alpaca IEX.
 
-        The CSV contains daily historical VIX data, updated after each
-        market session. The most recent row is the previous day's close —
-        appropriate for a regime filter since VIX is a trend indicator, not
-        a tick-by-tick signal.
+        VIXY is a VIX short-term futures ETF — its price moves directionally
+        with VIX (up when fear rises, down when calm). We log it alongside
+        every signal for post-trade analysis so we can review what the fear
+        environment looked like when each trade was taken.
 
-        Caches the value for the entire trading day to avoid redundant
-        HTTP requests (the underlying data doesn't change intraday).
+        This does NOT gate any trades. Regime direction comes from SPY 200-DMA.
+        Trade quality comes from conviction scoring. VIXY is audit data only.
 
-        Falls back to 20.0 (CHOPPY territory) if the fetch fails.
+        Returns 0.0 on failure — logged as-is, never blocks execution.
         """
-        today = datetime.now(timezone.utc).date()
-
-        # Return cached value if already fetched today
-        if self._vix_cache_date == today and self._vix_cache_value is not None:
-            logger.debug("VIX from cache: %.2f", self._vix_cache_value)
-            return self._vix_cache_value
-
         try:
-            resp = requests.get(CBOE_VIX_CSV_URL, timeout=15)
-            resp.raise_for_status()
-
-            # CSV format: DATE,OPEN,HIGH,LOW,CLOSE
-            # Example row: 06/16/2026,14.23,15.01,13.98,14.55
-            lines = [ln.strip() for ln in resp.text.strip().split("\n") if ln.strip()]
-            # Skip header row, take the last data row
-            last_row = lines[-1].split(",")
-            vix_close = float(last_row[4])  # CLOSE column index
-
-            self._vix_cache_date = today
-            self._vix_cache_value = vix_close
-            logger.info("VIX from CBOE CSV: %.2f  (row date: %s)", vix_close, last_row[0])
-            return vix_close
-
+            bars = self._client.get_stock_latest_bar(
+                StockLatestBarRequest(symbol_or_symbols="VIXY", feed=DataFeed.IEX)
+            )
+            price = float(bars["VIXY"].close)
+            logger.info("VIXY (VIX proxy, audit only): %.2f", price)
+            return price
         except Exception as exc:
-            logger.error("Failed to fetch VIX from CBOE: %s", exc)
-            # If we have a stale cache from a previous day, still use it — better than nothing
-            if self._vix_cache_value is not None:
-                logger.warning("Using stale VIX cache: %.2f", self._vix_cache_value)
-                return self._vix_cache_value
-            # Conservative default: 20 puts us in CHOPPY (no trades) until real data arrives
-            logger.warning("No VIX data available — defaulting to 20.0 (CHOPPY)")
-            return 20.0
+            logger.warning("Could not fetch VIXY price: %s — logging 0", exc)
+            return 0.0
 
     # -----------------------------------------------------------------------
     # Stock bars — Alpaca Data API

@@ -75,7 +75,7 @@ _open_trade_ids: dict[str, str | None] = {
 def _run_strategy(
     strategy: StrategyConfig,
     regime: Regime,
-    vix: float,
+    vixy_price: float,
     window: TimeWindow,
     min_score: int,
     limiter: DailyLimiter,
@@ -176,7 +176,7 @@ def _run_strategy(
     # Score tickers for this strategy
     conviction = None
     if strategy_name == "aggressive_3x":
-        conviction = evaluate_strategy_a(regime, vix, min_score, _cfg, _data)
+        conviction = evaluate_strategy_a(regime, vixy_price, min_score, _cfg, _data)
     else:
         conviction = evaluate_strategy_b(regime, min_score, _cfg, _data)
 
@@ -192,7 +192,7 @@ def _run_strategy(
             macd=conviction.macd_line,
             vwap=conviction.vwap,
             volume_ratio=conviction.volume_ratio,
-            vix=vix,
+            vix=vixy_price,   # stored as VIX proxy for audit — see signals table
             conviction_score=conviction.score,
             signal="BUY",
         )
@@ -236,11 +236,7 @@ def run_loop() -> None:
 
     # 1. Detect regime (once per tick, shared by both strategies)
     try:
-        regime, vix, spy_price, spy_sma = detect_regime(
-            vix_bear_threshold=_cfg.vix_bear_threshold,
-            vix_bull_threshold=_cfg.vix_bull_threshold,
-            data_client=_data,
-        )
+        regime, vixy_price, spy_price, spy_sma = detect_regime(data_client=_data)
     except RuntimeError as e:
         logger.error("Regime detection failed: %s", e)
         _db.log_event("ERROR", f"Regime detection failed: {e}")
@@ -248,11 +244,14 @@ def run_loop() -> None:
 
     # 2. Determine time window
     window, min_score = get_time_window(_cfg)
-    logger.info("Window=%s min_score=%d | Regime=%s VIX=%.1f", window.value, min_score, regime.value, vix)
+    logger.info(
+        "Window=%s min_score=%d | Regime=%s | SPY=%.2f SMA200=%.2f | VIXY=%.2f",
+        window.value, min_score, regime.value, spy_price, spy_sma, vixy_price,
+    )
 
     # 3. Run both strategies
-    _run_strategy(_cfg.strategy_a, regime, vix, window, min_score, _limiter_a)
-    _run_strategy(_cfg.strategy_b, regime, vix, window, min_score, _limiter_b)
+    _run_strategy(_cfg.strategy_a, regime, vixy_price, window, min_score, _limiter_a)
+    _run_strategy(_cfg.strategy_b, regime, vixy_price, window, min_score, _limiter_b)
 
 
 def write_daily_summary() -> None:
@@ -275,7 +274,7 @@ def write_daily_summary() -> None:
     max_drawdown = min(all_pnls) if all_pnls else 0.0
 
     try:
-        regime, vix, _, _ = detect_regime(_cfg.vix_bear_threshold, _cfg.vix_bull_threshold, _data)
+        regime, _, _, _ = detect_regime(_data)
         regime_str = regime.value
     except Exception:
         regime_str = "UNKNOWN"
@@ -294,17 +293,6 @@ def write_daily_summary() -> None:
         strategy_b_trades=b_count,
     )
     _db.log_event("REGIME_CHANGE", f"Daily close | A: ${a_pnl:.2f} | B: ${b_pnl:.2f} | Regime: {regime_str}")
-
-
-def prefetch_vix() -> None:
-    """
-    Pre-fetch and cache VIX from CBOE at 8:30am ET, before market open.
-    This warms the cache so the first trading tick (9:30am) doesn't pay
-    the HTTP cost or risk a timeout under load.
-    """
-    logger.info("Pre-fetching VIX from CBOE...")
-    vix = _data.fetch_vix()
-    logger.info("VIX cached for today: %.2f", vix)
 
 
 def main() -> None:
@@ -332,11 +320,6 @@ def main() -> None:
     _db.log_event("STARTED", "Bot v2 started — Strategy A (aggressive_3x) + Strategy B (conservative_multi)")
 
     scheduler = BlockingScheduler(timezone=ET)
-
-    # Pre-market VIX fetch at 8:30am — warms the CBOE cache before first tick
-    scheduler.add_job(prefetch_vix, CronTrigger(
-        day_of_week="mon-fri", hour=8, minute=30, timezone=ET
-    ), id="vix_prefetch")
 
     # Primary window: 9:30–10:55am
     scheduler.add_job(run_loop, CronTrigger(
