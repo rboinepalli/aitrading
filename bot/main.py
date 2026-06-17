@@ -114,6 +114,12 @@ def _run_strategy(
         partial_triggered = trade_row["partial_exit_triggered"] if trade_row else False
         stop_price = trade_row["stop_price"] if trade_row else active_position.entry_price
 
+        # Recover trade_id from Supabase after a bot restart (global resets to None)
+        if trade_id is None and trade_row:
+            trade_id = trade_row["id"]
+            _open_trade_ids[strategy_name] = trade_id
+            logger.info("[%s] Recovered trade_id=%s from Supabase after restart", strategy_name, trade_id)
+
         exit_decision = check_exit(
             position=active_position,
             strategy=strategy,
@@ -347,6 +353,11 @@ def main() -> None:
     scheduler.add_job(write_daily_summary, CronTrigger(
         day_of_week="mon-fri", hour=16, minute=0, timezone=ET
     ), id="daily_summary")
+
+    # Run one tick immediately on startup to recover any positions left open
+    # from a previous session (e.g. redeploy after market close)
+    logger.info("Running startup tick to recover any open positions...")
+    run_loop()
 
     logger.info("Scheduler started — Mon–Fri 9:30am–3:45pm ET")
     logger.info("Strategy A: TQQQ/SQQQ | Strategy B: QQQ/NVDA/AAPL/MSFT/AMD/SPY")
