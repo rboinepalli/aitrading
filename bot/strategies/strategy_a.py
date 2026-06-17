@@ -22,6 +22,7 @@ import logging
 from dataclasses import dataclass
 
 from config import Config, StrategyConfig
+from data.market_data import MarketDataClient
 from signals.indicators import fetch_indicators
 from signals.regime import Regime
 from signals.scorer import score_ticker, ConvictionScore
@@ -47,6 +48,7 @@ def evaluate_strategy_a(
     vix: float,
     min_score: int,
     cfg: Config,
+    data_client: MarketDataClient,
 ) -> ConvictionScore | None:
     """
     Score the appropriate ticker for Strategy A given the current regime.
@@ -66,7 +68,7 @@ def evaluate_strategy_a(
         logger.info("Strategy A: CHOPPY regime — sitting out")
         return None
 
-    snap = fetch_indicators(ticker, rsi_period=cfg.rsi_period)
+    snap = fetch_indicators(ticker, data_client=data_client, rsi_period=cfg.rsi_period)
     if snap is None:
         logger.warning("Strategy A: Could not fetch indicators for %s", ticker)
         return None

@@ -25,6 +25,7 @@ Partial exit at +3%:
 import logging
 
 from config import Config
+from data.market_data import MarketDataClient
 from signals.indicators import fetch_indicators
 from signals.regime import Regime
 from signals.scorer import score_ticker, pick_best_ticker, ConvictionScore
@@ -39,6 +40,7 @@ def evaluate_strategy_b(
     regime: Regime,
     min_score: int,
     cfg: Config,
+    data_client: MarketDataClient,
 ) -> ConvictionScore | None:
     """
     Score all Strategy B tickers and return the highest scorer if it
@@ -63,7 +65,7 @@ def evaluate_strategy_b(
 
     scores = []
     for ticker in cfg.strategy_b.tickers:
-        snap = fetch_indicators(ticker, rsi_period=cfg.rsi_period)
+        snap = fetch_indicators(ticker, data_client=data_client, rsi_period=cfg.rsi_period)
         if snap is None:
             logger.warning("Strategy B: Could not fetch %s — skipping", ticker)
             continue

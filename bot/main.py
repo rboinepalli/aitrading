@@ -31,6 +31,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from broker.alpaca_client import AlpacaClient
 from config import load_config, StrategyConfig
+from data.market_data import MarketDataClient
 from db.supabase_client import SupabaseDB
 from exits.exit_manager import check_exit, ExitReason
 from risk.daily_limiter import DailyLimiter
@@ -54,6 +55,7 @@ ET = pytz.timezone("America/New_York")
 _cfg = None
 _alpaca = None
 _db = None
+_data = None   # MarketDataClient — Alpaca data API + CBOE VIX
 
 # Per-strategy daily limiters
 _limiter_a = None
@@ -174,19 +176,18 @@ def _run_strategy(
     # Score tickers for this strategy
     conviction = None
     if strategy_name == "aggressive_3x":
-        conviction = evaluate_strategy_a(regime, vix, min_score, _cfg)
+        conviction = evaluate_strategy_a(regime, vix, min_score, _cfg, _data)
     else:
-        conviction = evaluate_strategy_b(regime, min_score, _cfg)
+        conviction = evaluate_strategy_b(regime, min_score, _cfg, _data)
 
     # Log signal to Supabase regardless of outcome (for audit)
     if conviction:
-        snap_ticker = conviction.ticker
         _db.insert_signal(
             strategy=strategy_name,
-            ticker=snap_ticker,
+            ticker=conviction.ticker,
             regime=regime.value,
             rsi=conviction.rsi,
-            ema_fast=0.0,   # simplified — full snap available in scorer
+            ema_fast=0.0,
             ema_slow=0.0,
             macd=conviction.macd_line,
             vwap=conviction.vwap,
@@ -238,6 +239,7 @@ def run_loop() -> None:
         regime, vix, spy_price, spy_sma = detect_regime(
             vix_bear_threshold=_cfg.vix_bear_threshold,
             vix_bull_threshold=_cfg.vix_bull_threshold,
+            data_client=_data,
         )
     except RuntimeError as e:
         logger.error("Regime detection failed: %s", e)
@@ -273,7 +275,7 @@ def write_daily_summary() -> None:
     max_drawdown = min(all_pnls) if all_pnls else 0.0
 
     try:
-        regime, vix, _, _ = detect_regime(_cfg.vix_bear_threshold, _cfg.vix_bull_threshold)
+        regime, vix, _, _ = detect_regime(_cfg.vix_bear_threshold, _cfg.vix_bull_threshold, _data)
         regime_str = regime.value
     except Exception:
         regime_str = "UNKNOWN"
@@ -294,9 +296,20 @@ def write_daily_summary() -> None:
     _db.log_event("REGIME_CHANGE", f"Daily close | A: ${a_pnl:.2f} | B: ${b_pnl:.2f} | Regime: {regime_str}")
 
 
+def prefetch_vix() -> None:
+    """
+    Pre-fetch and cache VIX from CBOE at 8:30am ET, before market open.
+    This warms the cache so the first trading tick (9:30am) doesn't pay
+    the HTTP cost or risk a timeout under load.
+    """
+    logger.info("Pre-fetching VIX from CBOE...")
+    vix = _data.fetch_vix()
+    logger.info("VIX cached for today: %.2f", vix)
+
+
 def main() -> None:
     """Startup: load config, connect services, start scheduler."""
-    global _cfg, _alpaca, _db, _limiter_a, _limiter_b
+    global _cfg, _alpaca, _db, _data, _limiter_a, _limiter_b
 
     logger.info("Starting AI Trading Bot v2...")
 
@@ -309,12 +322,21 @@ def main() -> None:
     _db = SupabaseDB(_cfg)
     logger.info("Supabase connected ✓")
 
+    # Market data client — Alpaca for stocks, CBOE CSV for VIX
+    _data = MarketDataClient(_cfg.alpaca_api_key, _cfg.alpaca_secret_key)
+    logger.info("MarketDataClient connected ✓")
+
     _limiter_a = DailyLimiter("aggressive_3x", _cfg.max_daily_loss_usd, _db)
     _limiter_b = DailyLimiter("conservative_multi", _cfg.max_daily_loss_usd, _db)
 
     _db.log_event("STARTED", "Bot v2 started — Strategy A (aggressive_3x) + Strategy B (conservative_multi)")
 
     scheduler = BlockingScheduler(timezone=ET)
+
+    # Pre-market VIX fetch at 8:30am — warms the CBOE cache before first tick
+    scheduler.add_job(prefetch_vix, CronTrigger(
+        day_of_week="mon-fri", hour=8, minute=30, timezone=ET
+    ), id="vix_prefetch")
 
     # Primary window: 9:30–10:55am
     scheduler.add_job(run_loop, CronTrigger(

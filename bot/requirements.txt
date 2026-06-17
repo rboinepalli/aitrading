@@ -8,9 +8,6 @@ alpaca-py==0.34.0
 # Data manipulation — the backbone of all indicator math
 pandas==2.2.3
 
-# Free Yahoo Finance API — VIX spot price + SPY historical bars
-yfinance==0.2.54
-
 # Supabase Python client — REST + real-time over Postgres
 supabase==2.15.2
 
