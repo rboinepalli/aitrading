@@ -58,7 +58,8 @@ def detect_regime(
     vix = data_client.fetch_vix()
 
     # SPY: 260 days of daily bars for 200-DMA calculation
-    spy_daily = data_client.get_daily_bars("SPY", days=260)
+    # 200 trading days ≈ 290 calendar days. Request 320 to absorb holidays + weekends.
+    spy_daily = data_client.get_daily_bars("SPY", days=320)
     if spy_daily.empty or len(spy_daily) < 200:
         raise RuntimeError(
             f"Insufficient SPY data for 200-DMA ({len(spy_daily)} rows, need 200)"
