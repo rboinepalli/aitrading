@@ -1,0 +1,133 @@
+"""
+signals/regime.py — Market regime detection.
+
+We classify the current market as one of three regimes:
+  BULL   → uptrend, low fear → trade leveraged bull ETF (TQQQ)
+  BEAR   → downtrend, high fear → trade leveraged bear ETF (SQQQ)
+  CHOPPY → no clear direction → sit out, no trades
+
+How we detect regime:
+  1. VIX (the "fear index") — when VIX is high, markets are volatile and risky
+     - VIX > 25  → BEAR (fear is elevated, trend likely down)
+     - VIX < 18  → potentially BULL (calm market)
+  2. SPY 200-day SMA — the gold standard trend indicator
+     - Price > 200-DMA → long-term uptrend (confirms BULL)
+     - Price < 200-DMA → long-term downtrend
+  3. Combined rule:
+     - VIX > 25                       → BEAR
+     - VIX < 18 AND price > 200-DMA  → BULL
+     - anything else                  → CHOPPY
+
+Why VIX?
+  VIX is the CBOE Volatility Index. It measures expected 30-day volatility of the S&P 500
+  derived from options pricing. High VIX = fear/uncertainty. Low VIX = complacency.
+  It's a proxy for "how scared is the market right now."
+
+Why 200-DMA?
+  The 200-day moving average is the most widely watched trend filter.
+  When price is above it, most institutional buyers consider the market healthy.
+  The major indices (and TQQQ) tend to trend when price > 200-DMA.
+"""
+
+import logging
+from enum import Enum
+from typing import Optional
+
+import pandas as pd
+import yfinance as yf
+
+logger = logging.getLogger(__name__)
+
+
+class Regime(str, Enum):
+    """
+    Market regime enum.
+
+    `str, Enum` means each value is also a string — so Regime.BULL == "BULL".
+    This makes it easy to store in Supabase without conversion.
+    TypeScript analogy: `type Regime = 'BULL' | 'BEAR' | 'CHOPPY'`
+    """
+    BULL = "BULL"
+    BEAR = "BEAR"
+    CHOPPY = "CHOPPY"
+
+
+def fetch_vix() -> Optional[float]:
+    """
+    Fetch the latest VIX value from Yahoo Finance.
+    Returns None if the fetch fails (e.g. outside market hours).
+
+    VIX ticker on Yahoo Finance is '^VIX'.
+    """
+    try:
+        data = yf.download("^VIX", period="2d", interval="1d", progress=False)
+        if data.empty:
+            return None
+        # Use the most recent close
+        return float(data["Close"].iloc[-1])
+    except Exception as exc:
+        logger.error("Failed to fetch VIX: %s", exc)
+        return None
+
+
+def fetch_spy_vs_200dma() -> Optional[tuple[float, float]]:
+    """
+    Fetch SPY's latest price and its 200-day SMA.
+    Returns (current_price, sma_200) or None on failure.
+
+    We use SPY (not QQQ) because the 200-DMA on SPY is the most
+    widely respected trend filter for US equities broadly.
+    """
+    try:
+        # Fetch 250 trading days — enough for a 200-period SMA to be stable
+        data = yf.download("SPY", period="250d", interval="1d", progress=False)
+        if len(data) < 200:
+            logger.warning("Not enough SPY data for 200-DMA (%d rows)", len(data))
+            return None
+
+        current_price = float(data["Close"].iloc[-1])
+
+        # .rolling(200).mean() computes a 200-period rolling average.
+        # TypeScript analogy: reduce + sliding window — pandas does it in one line.
+        sma_200 = float(data["Close"].rolling(200).mean().iloc[-1])
+
+        return current_price, sma_200
+    except Exception as exc:
+        logger.error("Failed to fetch SPY 200-DMA: %s", exc)
+        return None
+
+
+def detect_regime(
+    vix_bear_threshold: float,
+    vix_bull_threshold: float,
+) -> tuple[Regime, float, float, float]:
+    """
+    Determine the current market regime and return supporting data.
+
+    Returns:
+        (regime, vix, spy_price, spy_sma_200)
+
+    Raises:
+        RuntimeError if market data is unavailable.
+    """
+    vix = fetch_vix()
+    spy_data = fetch_spy_vs_200dma()
+
+    if vix is None or spy_data is None:
+        raise RuntimeError("Cannot determine regime: market data unavailable")
+
+    spy_price, spy_sma_200 = spy_data
+
+    # Apply regime rules in priority order
+    if vix > vix_bear_threshold:
+        regime = Regime.BEAR
+    elif vix < vix_bull_threshold and spy_price > spy_sma_200:
+        regime = Regime.BULL
+    else:
+        regime = Regime.CHOPPY
+
+    logger.info(
+        "Regime: %s | VIX=%.2f | SPY=%.2f vs SMA200=%.2f",
+        regime, vix, spy_price, spy_sma_200,
+    )
+    return regime, vix, spy_price, spy_sma_200

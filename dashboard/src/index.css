@@ -1,0 +1,4 @@
+/* Tailwind CSS directives — Vite + PostCSS transforms these into real CSS at build time */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
