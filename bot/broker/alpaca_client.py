@@ -59,25 +59,52 @@ class AlpacaClient:
         """
         Return available cash / buying power in dollars.
 
-        Alpaca paper accounts vary: margin accounts report buying_power as
-        4x daytrading equity (so the number is huge), while some accounts
-        return 0 for buying_power and put the real cash in account.cash.
-        We prefer non-marginable cash so we never over-lever.
+        Alpaca paper accounts expose several monetary fields — we try them
+        in order until we find one that's non-zero.
         """
         account = self._client.get_account()
-        bp = float(account.buying_power or 0)
-        cash = float(account.cash or 0)
-        equity = float(account.equity or 0)
-        # Log all three so we can see what Alpaca is returning
+
+        # Log every monetary field so we can see exactly what Alpaca returns
+        def _f(val) -> float:
+            try:
+                return float(val) if val is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        buying_power              = _f(account.buying_power)
+        cash                      = _f(account.cash)
+        equity                    = _f(account.equity)
+        portfolio_value           = _f(getattr(account, "portfolio_value", None))
+        non_marginable_bp         = _f(getattr(account, "non_marginable_buying_power", None))
+        regt_bp                   = _f(getattr(account, "regt_buying_power", None))
+        daytrading_bp             = _f(getattr(account, "daytrading_buying_power", None))
+
         logger.info(
-            "Account snapshot — buying_power=%.2f  cash=%.2f  equity=%.2f",
-            bp, cash, equity,
+            "Account — buying_power=%.2f  cash=%.2f  equity=%.2f  "
+            "portfolio_value=%.2f  non_marginable_bp=%.2f  regt_bp=%.2f  daytrading_bp=%.2f",
+            buying_power, cash, equity,
+            portfolio_value, non_marginable_bp, regt_bp, daytrading_bp,
         )
-        # If buying_power is 0 (common with some paper account types), fall back to cash.
-        # Cap at equity so we never exceed the real portfolio value.
-        if bp <= 0:
-            bp = cash if cash > 0 else equity
-        return bp
+
+        # Return the first non-zero value in preference order
+        for label, val in [
+            ("non_marginable_bp", non_marginable_bp),
+            ("cash",              cash),
+            ("equity",            equity),
+            ("portfolio_value",   portfolio_value),
+            ("regt_bp",           regt_bp),
+            ("buying_power",      buying_power),
+            ("daytrading_bp",     daytrading_bp),
+        ]:
+            if val > 0:
+                logger.info("Using %s = $%.2f as buying power", label, val)
+                return val
+
+        logger.error(
+            "All Alpaca account fields are 0 — check paper.alpaca.markets "
+            "to confirm the account has funds and the API key is correct."
+        )
+        return 0.0
 
     def get_daily_pnl(self) -> float:
         """
