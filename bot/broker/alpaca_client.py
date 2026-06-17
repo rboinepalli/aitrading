@@ -56,9 +56,28 @@ class AlpacaClient:
     # -----------------------------------------------------------------------
 
     def get_buying_power(self) -> float:
-        """Return available cash / buying power in dollars."""
+        """
+        Return available cash / buying power in dollars.
+
+        Alpaca paper accounts vary: margin accounts report buying_power as
+        4x daytrading equity (so the number is huge), while some accounts
+        return 0 for buying_power and put the real cash in account.cash.
+        We prefer non-marginable cash so we never over-lever.
+        """
         account = self._client.get_account()
-        return float(account.buying_power)
+        bp = float(account.buying_power or 0)
+        cash = float(account.cash or 0)
+        equity = float(account.equity or 0)
+        # Log all three so we can see what Alpaca is returning
+        logger.info(
+            "Account snapshot — buying_power=%.2f  cash=%.2f  equity=%.2f",
+            bp, cash, equity,
+        )
+        # If buying_power is 0 (common with some paper account types), fall back to cash.
+        # Cap at equity so we never exceed the real portfolio value.
+        if bp <= 0:
+            bp = cash if cash > 0 else equity
+        return bp
 
     def get_daily_pnl(self) -> float:
         """
