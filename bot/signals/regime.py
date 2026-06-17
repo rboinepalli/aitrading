@@ -52,6 +52,32 @@ class Regime(str, Enum):
     CHOPPY = "CHOPPY"
 
 
+def _extract_close(data: pd.DataFrame, ticker: str) -> Optional[pd.Series]:
+    """
+    Safely extract the Close column from a yfinance DataFrame.
+
+    yfinance 0.2.x returns MultiIndex columns even for single tickers:
+      ("Close", "^VIX"), ("Open", "^VIX"), ...
+    So data["Close"] returns a DataFrame, not a Series.
+    This helper handles both the old (flat) and new (MultiIndex) formats.
+    """
+    if data.empty:
+        return None
+    if isinstance(data.columns, pd.MultiIndex):
+        # MultiIndex: ("Close", ticker) — squeeze to Series
+        if ("Close", ticker) in data.columns:
+            return data[("Close", ticker)]
+        # Fallback: grab whatever is in the Close level
+        try:
+            return data["Close"].squeeze()
+        except Exception:
+            return None
+    # Flat columns
+    if "Close" in data.columns:
+        return data["Close"]
+    return None
+
+
 def fetch_vix() -> Optional[float]:
     """
     Fetch the latest VIX value from Yahoo Finance.
@@ -61,10 +87,11 @@ def fetch_vix() -> Optional[float]:
     """
     try:
         data = yf.download("^VIX", period="2d", interval="1d", progress=False)
-        if data.empty:
+        closes = _extract_close(data, "^VIX")
+        if closes is None or closes.empty:
+            logger.warning("VIX data empty or unavailable")
             return None
-        # Use the most recent close
-        return float(data["Close"].iloc[-1])
+        return float(closes.iloc[-1])
     except Exception as exc:
         logger.error("Failed to fetch VIX: %s", exc)
         return None
@@ -81,15 +108,16 @@ def fetch_spy_vs_200dma() -> Optional[tuple[float, float]]:
     try:
         # Fetch 250 trading days — enough for a 200-period SMA to be stable
         data = yf.download("SPY", period="250d", interval="1d", progress=False)
-        if len(data) < 200:
-            logger.warning("Not enough SPY data for 200-DMA (%d rows)", len(data))
+        closes = _extract_close(data, "SPY")
+        if closes is None or len(closes) < 200:
+            logger.warning("Not enough SPY data for 200-DMA (%d rows)", len(closes) if closes is not None else 0)
             return None
 
-        current_price = float(data["Close"].iloc[-1])
+        current_price = float(closes.iloc[-1])
 
         # .rolling(200).mean() computes a 200-period rolling average.
         # TypeScript analogy: reduce + sliding window — pandas does it in one line.
-        sma_200 = float(data["Close"].rolling(200).mean().iloc[-1])
+        sma_200 = float(closes.rolling(200).mean().iloc[-1])
 
         return current_price, sma_200
     except Exception as exc:
@@ -114,6 +142,9 @@ def detect_regime(
     spy_data = fetch_spy_vs_200dma()
 
     if vix is None or spy_data is None:
+        # Fall back to CHOPPY so the loop keeps running — no trades happen but bot stays alive.
+        # Root cause is usually a yfinance hiccup at market open; it self-heals next tick.
+        logger.warning("Market data unavailable — defaulting regime to CHOPPY this tick")
         raise RuntimeError("Cannot determine regime: market data unavailable")
 
     spy_price, spy_sma_200 = spy_data
