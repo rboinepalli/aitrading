@@ -120,6 +120,32 @@ def _run_strategy(
             _open_trade_ids[strategy_name] = trade_id
             logger.info("[%s] Recovered trade_id=%s from Supabase after restart", strategy_name, trade_id)
 
+        # Close positions held overnight — at the first market-hours tick after a
+        # new day begins. This handles the case where EOD close was missed (e.g.
+        # bot redeployed after 3:45pm) and the position carried into the next day.
+        if trade_row:
+            from datetime import time as _time
+            entry_dt = datetime.fromisoformat(
+                trade_row["entry_time"].replace("Z", "+00:00")
+            ).astimezone(ET)
+            market_open = _time(9, 30)
+            if entry_dt.date() < date.today() and datetime.now(ET).time() >= market_open:
+                logger.info(
+                    "[%s] Overnight position %s (entered %s) — closing at market open",
+                    strategy_name, active_position.ticker, entry_dt.date(),
+                )
+                _alpaca.sell_all(active_position.ticker)
+                if trade_id:
+                    _db.close_trade(
+                        trade_id=trade_id,
+                        exit_price=active_position.current_price,
+                        exit_time=datetime.now(timezone.utc),
+                        exit_reason="OVERNIGHT_CLOSE",
+                        pnl=active_position.unrealized_pnl,
+                    )
+                    _open_trade_ids[strategy_name] = None
+                return
+
         exit_decision = check_exit(
             position=active_position,
             strategy=strategy,

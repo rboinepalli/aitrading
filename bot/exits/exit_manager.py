@@ -44,6 +44,7 @@ class ExitReason(str, Enum):
     TAKE_PROFIT = "TAKE_PROFIT"         # sold remaining, trade closed
     STOP_LOSS = "STOP_LOSS"             # stop hit, trade closed
     EOD_CLOSE = "EOD_CLOSE"             # hard close at 3:45pm
+    OVERNIGHT_CLOSE = "OVERNIGHT_CLOSE" # position held overnight — close at next market open
     NONE = "NONE"
 
 
