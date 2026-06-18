@@ -172,13 +172,6 @@ class AlpacaClient:
         Close the entire position for a ticker via a market sell order.
         Returns the Alpaca order ID.
         """
-        request = MarketOrderRequest(
-            symbol=ticker,
-            qty=None,           # qty=None with close_position tells Alpaca to sell all shares
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.DAY,
-        )
-        # Use close_position which handles the full-position close cleanly
         order = self._client.close_position(ticker)
         logger.info("SELL order submitted: %s (id=%s)", ticker, order.id)
         return str(order.id)
