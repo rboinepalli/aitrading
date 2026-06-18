@@ -108,6 +108,22 @@ def _run_strategy(
             active_position = pos
             break
 
+    # Reconcile: if we think a position is open but Alpaca shows nothing,
+    # the position was closed outside the bot (manual close, margin call, etc.)
+    # Mark it closed in Supabase so the dashboard stays accurate.
+    if not active_position and trade_id:
+        stale_row = _db.get_open_trade_by_id(trade_id)
+        if stale_row:
+            logger.warning("[%s] Position closed outside bot — reconciling Supabase record", strategy_name)
+            _db.close_trade(
+                trade_id=trade_id,
+                exit_price=0.0,
+                exit_time=datetime.now(timezone.utc),
+                exit_reason="MANUAL_CLOSE",
+                pnl=0.0,
+            )
+        _open_trade_ids[strategy_name] = None
+
     if active_position:
         # Look up stored trade metadata (partial exit state, stop price)
         trade_row = _db.get_open_trade(active_position.ticker, strategy_name)

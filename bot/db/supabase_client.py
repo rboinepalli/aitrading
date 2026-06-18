@@ -98,9 +98,21 @@ class SupabaseDB:
         """Return the open trade row for a ticker+strategy, or None."""
         result = (
             self._db.table("trades")
-            .select("id, shares, entry_price, partial_exit_triggered, stop_price")
+            .select("id, shares, entry_price, partial_exit_triggered, stop_price, entry_time")
             .eq("ticker", ticker)
             .eq("strategy", strategy)
+            .eq("status", "OPEN")
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+
+    def get_open_trade_by_id(self, trade_id: str) -> Optional[dict]:
+        """Return an open trade row by ID — used to detect manual closes."""
+        result = (
+            self._db.table("trades")
+            .select("id")
+            .eq("id", trade_id)
             .eq("status", "OPEN")
             .limit(1)
             .execute()
