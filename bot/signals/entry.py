@@ -1,21 +1,23 @@
 """
 signals/entry.py — Time window gating for entries.
 
-v2 responsibility: determine WHICH time window we're in and return
+v3 responsibility: determine WHICH time window we're in and return
 the minimum conviction score required. The actual scoring happens
-in strategies/strategy_a.py and strategies/strategy_b.py.
+in strategies/strategy_a.py, strategy_b.py, and strategy_c.py.
 
 Time windows (ET):
-  9:30–11:00am  PRIMARY     → min score 5/8 — strongest signals, most volume
-  11:00am–2pm   DEAD ZONE   → NO ENTRIES — markets are choppy mid-day
-  2pm–3:30pm    POWER HOUR  → min score 6/8 — second window, stricter bar
+  9:30–11:30am  PRIMARY     → min score 5/8 — strongest signals, most volume
+  11:30am–1:30pm DEAD ZONE  → NO ENTRIES — markets are choppy mid-day
+  1:30pm–3:30pm POWER HOUR  → min score 6/8 — second window, stricter bar
   After 3:30pm  NO ENTRY    → too close to hard close at 3:45pm
 
-Why avoid 11am–2pm?
-  Studies consistently show intraday volume and directional momentum are
-  weakest between 11am and 2pm. This is when algo strategies produce the
-  most false signals — high noise, low signal. Sitting out costs very few
-  profitable trades and avoids a lot of losers.
+Note: DEAD ZONE still runs exit checks on open positions (changed in v3).
+      Only NEW entries are blocked; stops and TPs are always monitored.
+
+Why avoid 11:30am–1:30pm?
+  Intraday volume and directional momentum are weakest mid-day.
+  Narrowed from 11am–2pm (v2) to 11:30am–1:30pm (v3) to capture
+  the 11:00–11:30am and 1:30–2:00pm windows which often have good setups.
 """
 
 import logging

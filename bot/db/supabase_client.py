@@ -68,12 +68,17 @@ class SupabaseDB:
         return trade_id
 
     def mark_partial_exit(self, trade_id: str, stop_price: float) -> None:
-        """After selling 50%, mark partial exit and set stop to breakeven."""
+        """After selling 50%, mark partial exit and set initial trailing stop price."""
         self._db.table("trades").update({
             "partial_exit_triggered": True,
-            "stop_price": stop_price,   # stop now = entry_price (breakeven)
+            "stop_price": stop_price,
         }).eq("id", trade_id).execute()
-        logger.info("Partial exit marked for trade %s, stop moved to $%.2f", trade_id, stop_price)
+        logger.info("Partial exit marked for trade %s, trailing stop set to $%.2f", trade_id, stop_price)
+
+    def update_stop_price(self, trade_id: str, stop_price: float) -> None:
+        """Ratchet the trailing stop price upward as price moves in our favour."""
+        self._db.table("trades").update({"stop_price": stop_price}).eq("id", trade_id).execute()
+        logger.info("Trailing stop updated for trade %s → $%.2f", trade_id, stop_price)
 
     def close_trade(
         self,

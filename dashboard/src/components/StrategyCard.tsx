@@ -9,10 +9,10 @@ import { format } from 'date-fns'
 import type { Trade } from '../hooks/useTrades'
 
 interface Props {
-  strategyName: string        // "aggressive_3x" or "conservative_multi"
-  displayName: string         // "Strategy A" or "Strategy B"
-  description: string         // "TQQQ / SQQQ" or "QQQ / NVDA / AAPL..."
-  accentColor: string         // tailwind color class prefix e.g. "blue" or "purple"
+  strategyName: string        // "aggressive_3x" | "momentum_stocks" | "aggressive_semis"
+  displayName: string         // "Strategy A" | "Strategy B" | "Strategy C"
+  description: string
+  accentColor: string         // tailwind color prefix: "blue" | "purple" | "orange"
 }
 
 async function fetchOpenPosition(strategyName: string): Promise<Trade | null> {
@@ -50,7 +50,7 @@ export function StrategyCard({ strategyName, displayName, description, accentCol
         </div>
         {/* Strategy name badge */}
         <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${badgeClass}`}>
-          {strategyName === 'aggressive_3x' ? '3x' : 'Multi'}
+          {strategyName === 'aggressive_3x' ? '3× Nasdaq' : strategyName === 'aggressive_semis' ? '3× Semis' : 'Momentum'}
         </span>
       </div>
 

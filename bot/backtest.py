@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """
-backtest.py — Offline strategy backtesting.
+backtest.py — Offline strategy backtesting (v3).
 
 Usage:
   python backtest.py                  # last 3 months
   python backtest.py --months 6       # last 6 months
   python backtest.py --start 2025-01-01 --end 2025-06-17
+  python backtest.py --strategy a     # only Strategy A
+  python backtest.py --strategy b     # only Strategy B
+  python backtest.py --strategy c     # only Strategy C (SOXL/SOXS)
 
 What it does:
   1. Fetches historical bars from Alpaca IEX (same source as live bot)
-  2. Replays the strategy day-by-day, bar-by-bar (every 5 minutes)
-  3. Applies the same conviction scoring and entry/exit rules as the live bot
+  2. Replays each strategy bar-by-bar (every 5 minutes)
+  3. Applies the same conviction scoring, sizing, and exit rules as v3 live bot
+     - Trailing stop after partial exit
+     - Conviction-scaled position sizing (5/8=80%, 6/8=100%, 7+/8=130%)
+     - Dead zone: 11:30am–1:30pm (v3 times)
+     - Strategy C always requires 6/8 minimum
   4. Pushes results to Supabase → visible in the dashboard Backtest tab
 
-This runs locally on your laptop — Railway is not involved.
-Results go into three Supabase tables: backtest_runs, backtest_trades, backtest_equity.
+Runs locally on your laptop. Railway is not involved.
+Results go to: backtest_runs, backtest_trades, backtest_equity in Supabase.
 """
 
 import argparse
@@ -29,7 +36,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Import bot modules (run from bot/ directory)
 from config import load_config
 from data.market_data import MarketDataClient, _normalise
 from db.supabase_client import SupabaseDB
@@ -46,10 +52,12 @@ logger = logging.getLogger(__name__)
 
 ET = pytz.timezone("America/New_York")
 
+# Conviction scaling — mirrors position_manager.py
+_CONVICTION_SCALE = {5: 0.80, 6: 1.00, 7: 1.15, 8: 1.30}
+
 
 # ---------------------------------------------------------------------------
-# Indicator math — mirrors signals/indicators.py but takes bar slices directly
-# (no API calls — all data is pre-fetched before the replay loop)
+# Indicator math — mirrors signals/indicators.py but operates on bar slices
 # ---------------------------------------------------------------------------
 
 def _ema(closes: pd.Series, period: int) -> pd.Series:
@@ -67,7 +75,6 @@ def _rsi(closes: pd.Series, period: int = 14) -> float:
 
 
 def _macd_cross(closes: pd.Series) -> bool:
-    """True if MACD line crossed above signal line on the last bar."""
     if len(closes) < 27:
         return False
     macd = _ema(closes, 12) - _ema(closes, 26)
@@ -85,7 +92,6 @@ def score_slice(intraday: pd.DataFrame, daily: pd.DataFrame,
     """
     Compute conviction score from pre-fetched bar slices.
     Same 6-signal, 0-8 point system as the live scorer.
-    Returns (score, signals_fired).
     """
     if len(intraday) < 30:
         return 0, []
@@ -98,10 +104,9 @@ def score_slice(intraday: pd.DataFrame, daily: pd.DataFrame,
     ema20    = float(_ema(closes, 20).iloc[-1])
     macd_hit = _macd_cross(closes)
 
-    vol_avg  = volumes.rolling(20).mean().iloc[-1]
+    vol_avg   = volumes.rolling(20).mean().iloc[-1]
     vol_ratio = float(volumes.iloc[-1] / vol_avg) if vol_avg > 0 else 1.0
 
-    # VWAP uses only today's bars — index is UTC, same calendar day as ET open
     today_date = intraday.index[-1].date()
     today_bars = intraday[intraday.index.date == today_date]
     vwap = _vwap(today_bars) if len(today_bars) > 1 else price
@@ -109,12 +114,12 @@ def score_slice(intraday: pd.DataFrame, daily: pd.DataFrame,
     five_day = len(daily) >= 6 and float(daily["Close"].iloc[-1]) > float(daily["Close"].iloc[-6])
 
     score, fired = 0, []
-    if rsi < rsi_oversold:      score += 2; fired.append("RSI")
-    if price > ema20:           score += 1; fired.append("EMA20")
-    if macd_hit:                score += 2; fired.append("MACD")
-    if vol_ratio >= vol_threshold: score += 1; fired.append("VOLUME")
-    if price > vwap:            score += 1; fired.append("VWAP")
-    if five_day:                score += 1; fired.append("5DAY")
+    if rsi < rsi_oversold:           score += 2; fired.append("RSI")
+    if price > ema20:                score += 1; fired.append("EMA20")
+    if macd_hit:                     score += 2; fired.append("MACD")
+    if vol_ratio >= vol_threshold:   score += 1; fired.append("VOLUME")
+    if price > vwap:                 score += 1; fired.append("VWAP")
+    if five_day:                     score += 1; fired.append("5DAY")
 
     return score, fired
 
@@ -125,7 +130,7 @@ def score_slice(intraday: pd.DataFrame, daily: pd.DataFrame,
 
 def regime_for_day(spy_daily: pd.DataFrame, day: date) -> str:
     """BULL if SPY is above its 200-DMA on this day, else BEAR."""
-    mask = spy_daily.index.date <= day
+    mask   = spy_daily.index.date <= day
     subset = spy_daily[mask]
     if len(subset) < 200:
         return "BULL"
@@ -135,21 +140,29 @@ def regime_for_day(spy_daily: pd.DataFrame, day: date) -> str:
 
 
 def time_window(ts) -> str:
-    """PRIMARY / DEAD_ZONE / POWER_HOUR / CLOSED for a bar timestamp."""
+    """Time window label for a bar timestamp. Matches v3 live bot config."""
     from datetime import time as dtime
     t = ts.tz_convert(ET).time() if ts.tzinfo else ts.time()
-    if dtime(9, 30) <= t < dtime(11, 0):  return "PRIMARY"
-    if dtime(11, 0) <= t < dtime(14, 0):  return "DEAD_ZONE"
-    if dtime(14, 0) <= t < dtime(15, 30): return "POWER_HOUR"
+    if dtime(9, 30)  <= t < dtime(11, 30): return "PRIMARY"
+    if dtime(11, 30) <= t < dtime(13, 30): return "DEAD_ZONE"
+    if dtime(13, 30) <= t < dtime(15, 30): return "POWER_HOUR"
     return "CLOSED"
 
 
-def min_score(window: str) -> int:
-    return {"PRIMARY": 5, "POWER_HOUR": 6}.get(window, 0)
+def min_score_for_window(window: str, strategy_min: int = 5) -> int:
+    """Return the effective min score for a strategy in this window."""
+    window_min = {"PRIMARY": 5, "POWER_HOUR": 6}.get(window, 0)
+    return max(window_min, strategy_min)
+
+
+def scaled_max_spend(max_per_trade: float, score: int) -> float:
+    """Apply conviction multiplier to max trade size — mirrors position_manager.py."""
+    scale = _CONVICTION_SCALE.get(min(max(score, 5), 8), 1.0)
+    return max_per_trade * scale
 
 
 def fetch_full_intraday(client, ticker: str, days: int) -> pd.DataFrame:
-    """Fetch a long run of 5-min bars at once (for backtest replay)."""
+    """Fetch a long run of 5-min bars at once (pre-fetched before replay loop)."""
     end   = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
     try:
@@ -171,27 +184,33 @@ def fetch_full_intraday(client, ticker: str, days: int) -> pd.DataFrame:
 
 class BacktestEngine:
     """
-    Replays the live bot strategy on historical bars.
+    Replays the v3 live bot strategy on historical bars.
 
-    For each 5-minute bar in the backtest period:
+    For each bar in the backtest period:
       1. Determine regime (BULL/BEAR) from SPY 200-DMA
-      2. Determine time window (PRIMARY / POWER_HOUR / skip others)
-      3. Score each strategy's tickers via conviction scoring
-      4. Simulate entries and exits using the same rules as the live bot
-
-    No API calls happen inside the replay loop — all data is pre-fetched.
+      2. Determine time window using v3 dead zone (11:30am–1:30pm)
+      3. Check exits on open positions (all windows — same as v3)
+         - Partial exit → set initial trailing stop
+         - Each holding bar → ratchet trailing stop upward
+         - Full TP / stop loss / EOD close
+      4. Evaluate entries (PRIMARY / POWER_HOUR only)
+         - Conviction-scaled sizing
+         - Strategy C always requires 6/8
     """
 
-    def __init__(self, data_client: MarketDataClient, cfg, start: date, end: date):
+    def __init__(self, data_client: MarketDataClient, cfg, start: date, end: date,
+                 strategies: list[str] = None):
         self._data   = data_client
         self._cfg    = cfg
         self.start   = start
         self.end     = end
+        # Which strategies to run — default all three
+        self.strategies = strategies or ["aggressive_3x", "momentum_stocks", "aggressive_semis"]
         self.trades: list[dict] = []
         self.daily_pnl: dict[date, float] = {}
 
     def run(self) -> dict:
-        days = (self.end - self.start).days + 280  # +280 = 200-DMA warmup + weekends
+        days = (self.end - self.start).days + 280  # +280 for 200-DMA warmup + weekends
 
         # ── Fetch all data upfront ──────────────────────────────────────────
         logger.info("Fetching SPY daily bars...")
@@ -199,15 +218,18 @@ class BacktestEngine:
         if spy_daily.empty:
             raise RuntimeError("Could not fetch SPY daily bars from Alpaca")
 
+        # Gather all unique tickers across selected strategies
         all_tickers = list(dict.fromkeys(
-            self._cfg.strategy_a.tickers + self._cfg.strategy_b.tickers
+            self._cfg.strategy_a.tickers +
+            self._cfg.strategy_b.tickers +
+            self._cfg.strategy_c.tickers
         ))
 
-        logger.info("Fetching 5-min bars for %d tickers...", len(all_tickers))
+        logger.info("Fetching 5-min bars for %d tickers: %s", len(all_tickers), all_tickers)
         intraday: dict[str, pd.DataFrame] = {}
         daily:    dict[str, pd.DataFrame] = {}
         for ticker in all_tickers:
-            logger.info("  %s...", ticker)
+            logger.info("  Fetching %s...", ticker)
             intraday[ticker] = fetch_full_intraday(self._data._client, ticker, days)
             daily[ticker]    = self._data.get_daily_bars(ticker, days=days)
 
@@ -218,21 +240,18 @@ class BacktestEngine:
         logger.info("Replaying %d trading days (%s → %s)", len(trading_days), self.start, self.end)
 
         # ── Replay ──────────────────────────────────────────────────────────
-        # open_pos: strategy_name → {ticker, entry_price, shares, score, partial, stop_price}
+        # open_pos maps strategy_name → {ticker, entry_price, shares, score, partial, stop_price, stop_basis}
         open_pos: dict[str, dict] = {}
 
         for day in trading_days:
             day_pnl = 0.0
+            regime  = regime_for_day(spy_daily, day)
 
-            regime = regime_for_day(spy_daily, day)
-
-            # Collect all 5-min timestamps for this day
             day_timestamps: set = set()
             for df in intraday.values():
-                if df.empty:
-                    continue
-                mask = df.index.date == day
-                day_timestamps.update(df.index[mask].tolist())
+                if not df.empty:
+                    mask = df.index.date == day
+                    day_timestamps.update(df.index[mask].tolist())
             if not day_timestamps:
                 self.daily_pnl[day] = 0.0
                 continue
@@ -240,7 +259,7 @@ class BacktestEngine:
             for ts in sorted(day_timestamps):
                 window = time_window(ts)
 
-                # ── Exits (run in every window including CLOSED for EOD) ──
+                # ── Exits: run in every window including DEAD_ZONE and CLOSED ──
                 for strat in list(open_pos.keys()):
                     pos    = open_pos[strat]
                     ticker = pos["ticker"]
@@ -250,23 +269,39 @@ class BacktestEngine:
 
                     current = float(df.loc[ts, "Close"])
                     pnl_pct = (current - pos["entry_price"]) / pos["entry_price"]
-                    strat_cfg = self._cfg.strategy_a if strat == "aggressive_3x" else self._cfg.strategy_b
+                    strat_cfg = self._get_strat_cfg(strat)
 
                     exit_reason = None
 
+                    # EOD hard close
                     if window == "CLOSED":
                         exit_reason = "EOD_CLOSE"
+
+                    # Partial exit
                     elif not pos["partial"] and pnl_pct >= strat_cfg.partial_exit_pct:
                         half = max(1, pos["shares"] // 2)
                         pnl  = half * (current - pos["entry_price"])
                         self._record(strat, pos, current, half, pnl, "PARTIAL_PROFIT", regime, day)
-                        day_pnl += pnl
-                        pos["shares"]     -= half
-                        pos["partial"]     = True
-                        pos["stop_price"]  = pos["entry_price"]
+                        day_pnl     += pnl
+                        pos["shares"] -= half
+                        pos["partial"] = True
+                        # Set initial trailing stop: trailing_stop_pct below current price
+                        pos["stop_price"] = current * (1 - strat_cfg.trailing_stop_pct)
                         continue
+
+                    # Full take profit (second half)
                     elif pos["partial"] and pnl_pct >= strat_cfg.take_profit_pct:
                         exit_reason = "TAKE_PROFIT"
+
+                    # Stop loss — uses trailing stop_price after partial, else entry-based SL
+                    elif pos["partial"]:
+                        # Ratchet trailing stop upward each bar
+                        new_trail = current * (1 - strat_cfg.trailing_stop_pct)
+                        if new_trail > pos["stop_price"]:
+                            pos["stop_price"] = new_trail
+                        # Exit if current price falls below trailing stop
+                        if current < pos["stop_price"]:
+                            exit_reason = "STOP_LOSS"
                     elif pnl_pct <= -strat_cfg.stop_loss_pct:
                         exit_reason = "STOP_LOSS"
 
@@ -276,54 +311,79 @@ class BacktestEngine:
                         day_pnl += pnl
                         del open_pos[strat]
 
-                # ── Entries (PRIMARY and POWER_HOUR only) ───────────────────
+                # ── Entries: PRIMARY and POWER_HOUR only ────────────────────
                 if window not in ("PRIMARY", "POWER_HOUR"):
                     continue
-                req_score = min_score(window)
 
-                # Strategy A
-                if "aggressive_3x" not in open_pos:
+                # Strategy A: aggressive_3x (TQQQ / SQQQ)
+                if "aggressive_3x" in self.strategies and "aggressive_3x" not in open_pos:
                     ticker_a = (self._cfg.strategy_a.tickers[0] if regime == "BULL"
                                 else self._cfg.strategy_a.tickers[1])
+                    req = min_score_for_window(window, self._cfg.strategy_a.primary_min_score)
                     score, _ = self._score_at(ticker_a, ts, day, intraday, daily)
-                    if score >= req_score:
+                    if score >= req and ticker_a in intraday and ts in intraday[ticker_a].index:
                         price  = float(intraday[ticker_a].loc[ts, "Close"])
-                        shares = math.floor(self._cfg.max_per_trade_usd / price)
+                        spend  = scaled_max_spend(self._cfg.max_per_trade_usd, score)
+                        shares = math.floor(min(spend, self._cfg.strategy_a.budget_usd) / price)
                         if shares > 0:
                             open_pos["aggressive_3x"] = {
                                 "ticker": ticker_a, "entry_price": price,
                                 "shares": shares, "score": score,
-                                "partial": False, "stop_price": None,
+                                "partial": False, "stop_price": price,
                             }
 
-                # Strategy B (BULL only)
-                if "conservative_multi" not in open_pos and regime == "BULL":
+                # Strategy B: momentum_stocks (BULL only)
+                if "momentum_stocks" in self.strategies and "momentum_stocks" not in open_pos and regime == "BULL":
+                    req = min_score_for_window(window, self._cfg.strategy_b.primary_min_score)
                     best_score, best_ticker = 0, None
                     for ticker in self._cfg.strategy_b.tickers:
                         score, _ = self._score_at(ticker, ts, day, intraday, daily)
                         if score > best_score:
                             best_score, best_ticker = score, ticker
-
-                    if best_score >= req_score and best_ticker:
+                    if best_score >= req and best_ticker and ts in intraday.get(best_ticker, pd.DataFrame()).index:
                         price  = float(intraday[best_ticker].loc[ts, "Close"])
-                        shares = math.floor(self._cfg.max_per_trade_usd / price)
+                        spend  = scaled_max_spend(self._cfg.max_per_trade_usd, best_score)
+                        shares = math.floor(min(spend, self._cfg.strategy_b.budget_usd) / price)
                         if shares > 0:
-                            open_pos["conservative_multi"] = {
+                            open_pos["momentum_stocks"] = {
                                 "ticker": best_ticker, "entry_price": price,
                                 "shares": shares, "score": best_score,
-                                "partial": False, "stop_price": None,
+                                "partial": False, "stop_price": price,
+                            }
+
+                # Strategy C: aggressive_semis (SOXL / SOXS) — always requires 6/8
+                if "aggressive_semis" in self.strategies and "aggressive_semis" not in open_pos:
+                    ticker_c = (self._cfg.strategy_c.tickers[0] if regime == "BULL"
+                                else self._cfg.strategy_c.tickers[1])
+                    req = min_score_for_window(window, self._cfg.strategy_c.primary_min_score)  # always 6
+                    score, _ = self._score_at(ticker_c, ts, day, intraday, daily)
+                    if score >= req and ticker_c in intraday and ts in intraday[ticker_c].index:
+                        price  = float(intraday[ticker_c].loc[ts, "Close"])
+                        spend  = scaled_max_spend(self._cfg.max_per_trade_usd, score)
+                        shares = math.floor(min(spend, self._cfg.strategy_c.budget_usd) / price)
+                        if shares > 0:
+                            open_pos["aggressive_semis"] = {
+                                "ticker": ticker_c, "entry_price": price,
+                                "shares": shares, "score": score,
+                                "partial": False, "stop_price": price,
                             }
 
             self.daily_pnl[day] = round(day_pnl, 2)
 
         return self._summary()
 
+    def _get_strat_cfg(self, strategy_name: str):
+        if strategy_name == "aggressive_3x":    return self._cfg.strategy_a
+        if strategy_name == "momentum_stocks":  return self._cfg.strategy_b
+        if strategy_name == "aggressive_semis": return self._cfg.strategy_c
+        return self._cfg.strategy_b
+
     def _score_at(self, ticker: str, ts, day: date,
                   intraday: dict, daily: dict) -> tuple[int, list]:
         df = intraday.get(ticker)
         if df is None or df.empty:
             return 0, []
-        intra_slice = df[df.index <= ts].tail(100)  # last 100 bars for indicator warmup
+        intra_slice = df[df.index <= ts].tail(100)
         day_slice   = daily.get(ticker, pd.DataFrame())
         if not day_slice.empty:
             day_dates = (day_slice.index.tz_convert("UTC") if day_slice.index.tz
@@ -334,16 +394,16 @@ class BacktestEngine:
 
     def _record(self, strat, pos, exit_price, shares, pnl, reason, regime, day):
         self.trades.append({
-            "strategy":       strat,
-            "ticker":         pos["ticker"],
-            "entry_date":     day,
-            "entry_price":    pos["entry_price"],
-            "exit_price":     exit_price,
-            "shares":         shares,
-            "pnl":            round(pnl, 2),
-            "exit_reason":    reason,
+            "strategy":         strat,
+            "ticker":           pos["ticker"],
+            "entry_date":       day,
+            "entry_price":      pos["entry_price"],
+            "exit_price":       exit_price,
+            "shares":           shares,
+            "pnl":              round(pnl, 2),
+            "exit_reason":      reason,
             "conviction_score": pos["score"],
-            "regime":         regime,
+            "regime":           regime,
         })
 
     def _summary(self) -> dict:
@@ -351,29 +411,31 @@ class BacktestEngine:
         wins   = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p <= 0]
 
-        # Max drawdown: largest peak-to-trough on cumulative P&L
         cumulative, peak, max_dd = 0.0, 0.0, 0.0
         for p in pnls:
             cumulative += p
-            peak = max(peak, cumulative)
+            peak   = max(peak, cumulative)
             max_dd = max(max_dd, peak - cumulative)
 
         a_trades = [t for t in self.trades if t["strategy"] == "aggressive_3x"]
-        b_trades = [t for t in self.trades if t["strategy"] == "conservative_multi"]
+        b_trades = [t for t in self.trades if t["strategy"] == "momentum_stocks"]
+        c_trades = [t for t in self.trades if t["strategy"] == "aggressive_semis"]
 
         return {
-            "total_trades":    len(self.trades),
-            "winning_trades":  len(wins),
-            "losing_trades":   len(losses),
-            "win_rate":        round(len(wins) / len(self.trades), 3) if self.trades else 0,
-            "total_pnl":       round(sum(pnls), 2),
-            "avg_win":         round(sum(wins) / len(wins), 2) if wins else 0,
-            "avg_loss":        round(sum(losses) / len(losses), 2) if losses else 0,
-            "max_drawdown":    round(-max_dd, 2),
-            "strategy_a_pnl":  round(sum(t["pnl"] for t in a_trades), 2),
-            "strategy_b_pnl":  round(sum(t["pnl"] for t in b_trades), 2),
+            "total_trades":      len(self.trades),
+            "winning_trades":    len(wins),
+            "losing_trades":     len(losses),
+            "win_rate":          round(len(wins) / len(self.trades), 3) if self.trades else 0,
+            "total_pnl":         round(sum(pnls), 2),
+            "avg_win":           round(sum(wins) / len(wins), 2) if wins else 0,
+            "avg_loss":          round(sum(losses) / len(losses), 2) if losses else 0,
+            "max_drawdown":      round(-max_dd, 2),
+            "strategy_a_pnl":    round(sum(t["pnl"] for t in a_trades), 2),
+            "strategy_b_pnl":    round(sum(t["pnl"] for t in b_trades), 2),
+            "strategy_c_pnl":    round(sum(t["pnl"] for t in c_trades), 2),
             "strategy_a_trades": len(a_trades),
             "strategy_b_trades": len(b_trades),
+            "strategy_c_trades": len(c_trades),
         }
 
 
@@ -383,33 +445,38 @@ class BacktestEngine:
 
 def push_results(db: SupabaseDB, engine: BacktestEngine, summary: dict, cfg, start: date, end: date) -> str:
     config_snapshot = {
+        "dead_zone":             "11:30–13:30",
         "rsi_oversold":          cfg.rsi_oversold,
         "volume_ratio_threshold": cfg.volume_ratio_threshold,
         "max_per_trade_usd":     cfg.max_per_trade_usd,
-        "primary_min_score":     5,
-        "power_hour_min_score":  6,
         "strategy_a_tp":         cfg.strategy_a.take_profit_pct,
         "strategy_a_sl":         cfg.strategy_a.stop_loss_pct,
         "strategy_a_partial":    cfg.strategy_a.partial_exit_pct,
+        "strategy_a_trail":      cfg.strategy_a.trailing_stop_pct,
         "strategy_b_tp":         cfg.strategy_b.take_profit_pct,
         "strategy_b_sl":         cfg.strategy_b.stop_loss_pct,
         "strategy_b_partial":    cfg.strategy_b.partial_exit_pct,
+        "strategy_b_trail":      cfg.strategy_b.trailing_stop_pct,
+        "strategy_c_tp":         cfg.strategy_c.take_profit_pct,
+        "strategy_c_sl":         cfg.strategy_c.stop_loss_pct,
+        "strategy_c_partial":    cfg.strategy_c.partial_exit_pct,
+        "strategy_c_trail":      cfg.strategy_c.trailing_stop_pct,
     }
 
     result = db._db.table("backtest_runs").insert({
-        "start_date":       start.isoformat(),
-        "end_date":         end.isoformat(),
-        "config":           config_snapshot,
-        "total_trades":     summary["total_trades"],
-        "winning_trades":   summary["winning_trades"],
-        "losing_trades":    summary["losing_trades"],
-        "total_pnl":        summary["total_pnl"],
-        "win_rate":         summary["win_rate"],
-        "avg_win":          summary["avg_win"],
-        "avg_loss":         summary["avg_loss"],
-        "max_drawdown":     summary["max_drawdown"],
-        "strategy_a_pnl":   summary["strategy_a_pnl"],
-        "strategy_b_pnl":   summary["strategy_b_pnl"],
+        "start_date":        start.isoformat(),
+        "end_date":          end.isoformat(),
+        "config":            config_snapshot,
+        "total_trades":      summary["total_trades"],
+        "winning_trades":    summary["winning_trades"],
+        "losing_trades":     summary["losing_trades"],
+        "total_pnl":         summary["total_pnl"],
+        "win_rate":          summary["win_rate"],
+        "avg_win":           summary["avg_win"],
+        "avg_loss":          summary["avg_loss"],
+        "max_drawdown":      summary["max_drawdown"],
+        "strategy_a_pnl":    summary["strategy_a_pnl"],
+        "strategy_b_pnl":    summary["strategy_b_pnl"],
         "strategy_a_trades": summary["strategy_a_trades"],
         "strategy_b_trades": summary["strategy_b_trades"],
     }).execute()
@@ -417,24 +484,22 @@ def push_results(db: SupabaseDB, engine: BacktestEngine, summary: dict, cfg, sta
     run_id = result.data[0]["id"]
     logger.info("Backtest run saved: id=%s", run_id)
 
-    # Trades
     if engine.trades:
         db._db.table("backtest_trades").insert([{
-            "run_id":          run_id,
-            "strategy":        t["strategy"],
-            "ticker":          t["ticker"],
-            "entry_date":      t["entry_date"].isoformat(),
-            "entry_price":     t["entry_price"],
-            "exit_price":      t["exit_price"],
-            "shares":          t["shares"],
-            "pnl":             t["pnl"],
-            "exit_reason":     t["exit_reason"],
+            "run_id":           run_id,
+            "strategy":         t["strategy"],
+            "ticker":           t["ticker"],
+            "entry_date":       t["entry_date"].isoformat(),
+            "entry_price":      t["entry_price"],
+            "exit_price":       t["exit_price"],
+            "shares":           t["shares"],
+            "pnl":              t["pnl"],
+            "exit_reason":      t["exit_reason"],
             "conviction_score": t["conviction_score"],
-            "regime":          t["regime"],
+            "regime":           t["regime"],
         } for t in engine.trades]).execute()
 
-    # Equity curve
-    cumulative = 0.0
+    cumulative  = 0.0
     equity_rows = []
     for d in sorted(engine.daily_pnl):
         cumulative += engine.daily_pnl[d]
@@ -452,31 +517,41 @@ def push_results(db: SupabaseDB, engine: BacktestEngine, summary: dict, cfg, sta
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AI Trading Bot — Backtester")
-    parser.add_argument("--months", type=int, default=3, help="Months to backtest (default 3)")
-    parser.add_argument("--start",  type=str, help="Start date YYYY-MM-DD")
-    parser.add_argument("--end",    type=str, help="End date YYYY-MM-DD (default today)")
+    parser = argparse.ArgumentParser(description="AI Trading Bot v3 — Backtester")
+    parser.add_argument("--months",   type=int, default=3, help="Months to backtest (default 3)")
+    parser.add_argument("--start",    type=str, help="Start date YYYY-MM-DD")
+    parser.add_argument("--end",      type=str, help="End date YYYY-MM-DD (default today)")
+    parser.add_argument("--strategy", type=str, choices=["a", "b", "c"],
+                        help="Run only one strategy (default: all three)")
     args = parser.parse_args()
 
     end_date   = date.fromisoformat(args.end)   if args.end   else date.today()
     start_date = date.fromisoformat(args.start) if args.start else end_date - timedelta(days=30 * args.months)
 
-    logger.info("=== Backtest: %s → %s ===", start_date, end_date)
+    strategy_map = {
+        "a": ["aggressive_3x"],
+        "b": ["momentum_stocks"],
+        "c": ["aggressive_semis"],
+    }
+    strategies = strategy_map.get(args.strategy) if args.strategy else None
+
+    logger.info("=== Backtest v3: %s → %s | strategies=%s ===",
+                start_date, end_date, strategies or "all")
 
     cfg         = load_config()
     data_client = MarketDataClient(cfg.alpaca_api_key, cfg.alpaca_secret_key)
     db          = SupabaseDB(cfg)
 
-    engine  = BacktestEngine(data_client, cfg, start_date, end_date)
+    engine  = BacktestEngine(data_client, cfg, start_date, end_date, strategies)
     summary = engine.run()
 
     logger.info("=== RESULTS ===")
     for k, v in summary.items():
-        logger.info("  %-25s %s", k, v)
+        logger.info("  %-28s %s", k, v)
 
     run_id = push_results(db, engine, summary, cfg, start_date, end_date)
     logger.info("Open the dashboard Backtest tab to view results (run=%s)", run_id)
