@@ -53,7 +53,8 @@ TAKE_PROFIT_PCT    = float(os.environ.get("TAKE_PROFIT_PCT", 4.0))     # fallbac
 TIER1_WATCHLIST = [
     "NVDA", "AAPL", "MSFT", "GOOGL", "META", "AMZN", "TSLA", "AMD", "MU",
     "AVGO", "ARM", "TSM", "NFLX", "COIN", "PLTR", "SOFI", "MSTR", "SMCI",
-    "PYPL", "CRM",
+    "PYPL",
+    # CRM excluded — Salesforce employee, trading restricted
 ]
 
 # Sector ETF checks — confirms broader sector tailwind
@@ -63,7 +64,7 @@ SECTOR_ETFS = {
     "AAPL": "QQQ",  "MSFT": "QQQ", "GOOGL": "QQQ", "META": "QQQ",
     "AMZN": "QQQ",  "TSLA": "QQQ", "NFLX": "QQQ",
     "COIN": "QQQ",  "PLTR": "QQQ", "SOFI": "QQQ",
-    "MSTR": "QQQ",  "PYPL": "QQQ", "CRM": "QQQ",
+    "MSTR": "QQQ",  "PYPL": "QQQ",
 }
 
 # ---------------------------------------------------------------------------
