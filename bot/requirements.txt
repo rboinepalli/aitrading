@@ -1,27 +1,36 @@
 # =============================================================================
-# Python dependencies for the trading bot
+# Momentum Scanner Bot — Python dependencies
 # =============================================================================
 
-# Alpaca brokerage SDK — orders, positions, account data
+# Alpaca brokerage SDK — orders, positions, quotes, historical bars
 alpaca-py==0.34.0
 
-# Data manipulation — the backbone of all indicator math
+# Finnhub client — stock screener, top movers, company news
+finnhub-python==2.4.20
+
+# Technical indicators — EMA, RSI, ATR, VWAP via pandas-ta
+pandas-ta==0.3.14b0
+
+# Telegram bot — trade alerts + YES/NO approval flow
+python-telegram-bot==21.6
+
+# Data manipulation
 pandas==2.2.3
 
-# Supabase Python client — REST + real-time over Postgres
+# Supabase Python client
 supabase==2.15.2
 
-# Advanced job scheduler — runs the 5-min loop with cron-like precision
+# Job scheduler — scan schedule on Railway
 APScheduler==3.10.4
 
-# Loads .env files when running locally (no-op on Railway)
+# .env file loader (no-op on Railway)
 python-dotenv==1.0.1
 
-# Timezone-aware datetime handling — critical for ET market hours
+# Timezone handling — ET market hours
 pytz==2024.2
 
-# HTTP client (used internally by several dependencies)
+# HTTP client
 requests==2.32.3
 
-# numpy is required by pandas — pinning for reproducibility
+# numpy pinned for pandas compatibility
 numpy==1.26.4

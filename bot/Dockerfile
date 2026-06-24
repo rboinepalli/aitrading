@@ -23,4 +23,4 @@ COPY . .
 
 # Railway sets environment variables via its dashboard — we don't hardcode secrets here.
 # The CMD runs `python main.py` when the container starts.
-CMD ["python", "main.py"]
+CMD ["python", "scheduler.py"]

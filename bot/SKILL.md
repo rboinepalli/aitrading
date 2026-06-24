@@ -1,0 +1,614 @@
+
+name: momentum-scanner description: > Scan the live stock market for high-momentum stocks that are safe to enter for 1-2 day short-term swing trades. Invoke this skill whenever the user asks to scan the market, find momentum stocks, look for trading candidates, run the morning scan, or check what stocks are moving today. Also triggers on phrases like "what should I trade today", "any good setups", "run the scanner", or "find me a swing trade". Use this skill proactively at scheduled scan times (9:15 AM and 9:45 AM EST on weekdays) or whenever the user wants trade ideas.
+Momentum Scanner Skill
+Identify 1-2 day momentum trade candidates from the live market using a multi-step pipeline: screen → enrich → score → validate → output.
+
+
+Strategy Overview
+Timeframe: 1-2 day holds (short-term momentum / intraday swing) Direction: Long only (buying stocks expected to go up) Universe: Large/mid-cap liquid stocks ($2B+ market cap, $10+ price) Mode: Semi-automated — Claude scans and recommends, human approves entries, bot monitors and auto-exits
+
+
+Data Stack (no yfinance — production safe)
+Source
+Used For
+Auth
+Rate Limit
+Finnhub
+Screener, top movers, news catalyst, quotes
+Free API key
+60 req/min
+Alpaca Paper API
+Historical OHLCV, real-time quotes, order execution
+API key + secret
+Generous
+pandas-ta
+All technical indicators (EMA, RSI, ATR, VWAP)
+None (pip install)
+Local compute
+Supabase
+Trade logging, scan history, P&L, bot state
+URL + anon key
+Free tier sufficient
+Claude web search
+Catalyst validation, news confirmation
+Built-in
+Built-in
+
+
+⚠️ Do NOT use yfinance. It scrapes Yahoo Finance and is aggressively rate-limited / IP-banned in 2026, especially from cloud server IPs like Railway. All historical data comes from Alpaca; all indicators from pandas-ta.
+Key Library Patterns
+# Historical OHLCV from Alpaca (replaces yfinance)
+
+bars = alpaca.get_bars("MU", TimeFrame.Day, limit=60).df
+
+# Technical indicators from pandas-ta (replaces manual calculation)
+
+import pandas_ta as ta
+
+bars.ta.ema(length=9, append=True)     # adds EMA_9 column
+
+bars.ta.ema(length=20, append=True)    # adds EMA_20 column
+
+bars.ta.rsi(length=14, append=True)    # adds RSI_14 column
+
+bars.ta.atr(length=14, append=True)    # adds ATRr_14 column
+
+# Intraday bars for VWAP (today only)
+
+intraday = alpaca.get_bars("MU", TimeFrame.Minute, start=today).df
+
+intraday.ta.vwap(append=True)          # adds VWAP_D column
+
+# Top movers from Finnhub (replaces Finviz scraping)
+
+movers = finnhub_client.stock_symbols('US')
+
+quote  = finnhub_client.quote("MU")
+
+news   = finnhub_client.company_news("MU", _from=today, to=today)
+Supabase Patterns
+from supabase import create_client
+
+db = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+# Log a scan result
+
+db.table("scans").insert({
+
+    "ticker": "MU", "score": 88, "rsi": 62,
+
+    "volume_ratio": 2.8, "price_at_scan": 98.40,
+
+    "ema9_above": True, "vwap_above": True,
+
+    "catalyst_found": True, "catalyst_text": "MS upgrade",
+
+    "sector_etf_green": True
+
+}).execute()
+
+# Open a trade
+
+db.table("trades").insert({
+
+    "ticker": "MU", "phase": "paper",
+
+    "entry_price": 98.40, "stop_loss": 96.20, "target": 102.80,
+
+    "entry_time": datetime.utcnow().isoformat()
+
+}).execute()
+
+# Close a trade with P&L
+
+db.table("trades").update({
+
+    "exit_price": 102.50, "exit_reason": "target_hit",
+
+    "exit_time": datetime.utcnow().isoformat(),
+
+    "pnl_dollars": 4.10, "pnl_percent": 4.17
+
+}).eq("ticker", "MU").is_("exit_time", "null").execute()
+
+# Read/write bot state (crash recovery)
+
+db.table("bot_state").upsert({"key": "daily_loss", "value": "145.50"}).execute()
+
+state = db.table("bot_state").select("value").eq("key", "daily_loss").execute()
+
+
+Database Schema (4 tables)
+-- 1. Every scan result — even stocks not traded (backtesting source)
+
+CREATE TABLE scans (
+
+  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+
+  scanned_at       timestamptz DEFAULT now(),
+
+  ticker           text,
+
+  score            int,
+
+  rsi              numeric,
+
+  volume_ratio     numeric,
+
+  price_at_scan    numeric,
+
+  ema9_above       bool,
+
+  vwap_above       bool,
+
+  catalyst_found   bool,
+
+  catalyst_text    text,
+
+  sector_etf_green bool,
+
+  price_1day_later  numeric,   -- filled by EOD job next day
+
+  price_2days_later numeric    -- filled by EOD job day after
+
+);
+
+-- 2. Every approved trade (tracks full lifecycle)
+
+CREATE TABLE trades (
+
+  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+
+  scan_id      uuid REFERENCES scans(id),
+
+  ticker       text,
+
+  phase        text DEFAULT 'paper',   -- 'paper' or 'live'
+
+  entry_price  numeric,
+
+  stop_loss    numeric,
+
+  target       numeric,
+
+  entry_time   timestamptz,
+
+  exit_time    timestamptz,
+
+  exit_price   numeric,
+
+  exit_reason  text,   -- 'target_hit', 'stop_hit', 'rsi_exit', 'spy_circuit', 'force_eod'
+
+  pnl_dollars  numeric,
+
+  pnl_percent  numeric,
+
+  hold_hours   numeric
+
+);
+
+-- 3. Daily summary (auto-generated by EOD job)
+
+CREATE TABLE daily_summary (
+
+  date          date PRIMARY KEY,
+
+  trades_taken  int,
+
+  trades_won    int,
+
+  trades_lost   int,
+
+  total_pnl     numeric,
+
+  avg_hold_hrs  numeric,
+
+  best_ticker   text,
+
+  worst_ticker  text
+
+);
+
+-- 4. Bot state — survives restarts and crashes
+
+CREATE TABLE bot_state (
+
+  key        text PRIMARY KEY,
+
+  value      text,
+
+  updated_at timestamptz DEFAULT now()
+
+);
+
+-- Rows used:
+
+--   key='daily_loss'       value='145.50'
+
+--   key='positions_open'   value='1'
+
+--   key='trading_halted'   value='false'
+
+--   key='halt_reason'      value='daily_loss_limit'
+Backtesting Query Examples
+After 30+ scans, these queries measure real signal accuracy:
+
+-- Did high-score picks actually move up?
+
+SELECT
+
+  CASE WHEN score >= 80 THEN 'high' WHEN score >= 65 THEN 'medium' END AS tier,
+
+  COUNT(*) as picks,
+
+  ROUND(AVG((price_2days_later / price_at_scan - 1) * 100), 2) AS avg_return_pct,
+
+  SUM(CASE WHEN price_2days_later > price_at_scan THEN 1 ELSE 0 END) AS winners
+
+FROM scans
+
+WHERE price_2days_later IS NOT NULL
+
+GROUP BY tier;
+
+-- Does catalyst + sector tailwind improve outcomes?
+
+SELECT
+
+  catalyst_found, sector_etf_green,
+
+  COUNT(*) as count,
+
+  ROUND(AVG((price_2days_later / price_at_scan - 1) * 100), 2) AS avg_return_pct
+
+FROM scans
+
+WHERE price_2days_later IS NOT NULL
+
+GROUP BY catalyst_found, sector_etf_green
+
+ORDER BY avg_return_pct DESC;
+
+-- Overall P&L by exit reason
+
+SELECT exit_reason, COUNT(*) as trades,
+
+  ROUND(SUM(pnl_dollars), 2) as total_pnl,
+
+  ROUND(AVG(pnl_percent), 2) as avg_pnl_pct
+
+FROM trades
+
+GROUP BY exit_reason;
+
+
+Stock Universe
+Tier 1 — Core Watchlist (always scanned)
+NVDA, AAPL, MSFT, GOOGL, META, AMZN, TSLA, AMD, MU,
+
+AVGO, ARM, TSM, NFLX, COIN, PLTR, SOFI, MSTR, SMCI, PYPL, CRM
+Tier 2 — Dynamic (added by Finnhub movers daily)
+Top gainers from Finnhub that pass hard filters — catches breakouts outside the core watchlist (e.g. biotech catalyst, surprise earnings beat).
+
+Use Finnhub market status + quote endpoint to fetch % change leaders:
+
+# Get top % gainers with volume (Finnhub)
+
+# Filter: price > $10, mktcap > $2B, change% > 1.5%, volume > 500K
+
+
+Pipeline
+STEP 1 — Screen (Finnhub)
+Fetch today's top movers using Finnhub quote + symbol screener.
+
+Hard filters — candidate must pass ALL:
+
+Price > $10
+Market cap > $2B
+% change today > +1.5%
+Average volume (10-day) > 500K shares
+Today's volume > 1.5x the 10-day average
+
+Combine Tier 1 watchlist + Tier 2 Finnhub movers, deduplicate. Expected output: 10–25 candidates for enrichment.
+
+
+STEP 2 — Enrich (Alpaca + pandas-ta)
+For each candidate ticker:
+
+Via Alpaca — historical bars (60 days, daily):
+
+Pull OHLCV DataFrame
+Compute with pandas-ta:
+EMA(9), EMA(20)
+RSI(14)
+ATR(14) — for stop/target sizing
+Volume ratio: today's volume ÷ 10-day average volume
+
+Via Alpaca — intraday bars (today, 1-min):
+
+Compute VWAP via pandas-ta
+
+Via Alpaca — real-time quote:
+
+Last price (not delayed)
+Confirm asset is tradable
+Confirm asset is not halted
+
+
+STEP 3 — Score (0–100)
+Each candidate receives a composite score. Higher = better setup.
+Hard Disqualifiers (any one → drop immediately, do not score)
+RSI > 70 (overbought, chasing)
+RSI < 45 (no momentum)
+Price below 9 EMA (trend not confirmed)
+Price below VWAP (institutions net selling today)
+Volume ratio < 1.5x (no conviction behind the move)
+Scoring Breakdown
+Component
+Max Points
+Criteria
+Volume surge
+25
+1.5x=10pts, 2x=18pts, 3x+=25pts
+Price momentum
+20
+% gain: 1.5%=8pts, 3%=15pts, 5%+=20pts
+EMA position
+10
+Above 9 EMA=5pts, also above 20 EMA=+5pts
+VWAP position
+10
+Price > VWAP = 10pts
+RSI sweet spot
+15
+52–58=10pts, 58–65=15pts, 65–70=8pts
+News catalyst
+15
+Confirmed catalyst = 15pts, no news = 0pts
+Sector tailwind
+10
+Sector ETF green today = 10pts
+Pre-market gap held
+10
+Gapped up pre-market and held open = 10pts
+
+
+Total: 115 possible points → normalize to 100
+
+Minimum score to be recommended: 65/100
+
+
+STEP 4 — Validate (Finnhub News + Web Search)
+For top 3–5 candidates (score ≥ 65):
+
+Primary — Finnhub news:
+
+news = finnhub_client.company_news(ticker, _from=today, to=today)
+
+Secondary — Claude web search (if Finnhub news sparse):
+
+"[TICKER] stock news today"
+
+"[TICKER] why is it moving"
+
+Catalyst categories to identify:
+
+Earnings beat / guidance raise
+Analyst upgrade / price target raise
+Sector rotation / macro tailwind
+Product announcement / partnership
+Short squeeze signal
+
+Flag as "No clear catalyst" if nothing found — lower conviction, note in output.
+
+Sector ETF check (via Alpaca quote): | Sector | ETF to check | |---|---| | Semiconductors | SOXX | | Broad Tech | QQQ | | Financials | XLF | | Energy | XLE | | Biotech | XBI |
+
+Is the relevant sector ETF green today? (+10 pts if yes, already in scoring)
+
+
+STEP 5 — Calculate Entry, Stop, Target
+For each recommended stock:
+
+Entry zone:  current price to current price + 0.2%  (buy now or on slight dip)
+
+Stop loss:   entry price − 1.0 × ATR(14)            (natural breathing room)
+
+Target:      entry price + 2.0 × ATR(14)            (2:1 reward/risk minimum)
+
+Risk/Reward: always 2:1 minimum (enforced by ATR formula)
+
+Never chase: if price already up > 8% on the day before entry → skip regardless of score.
+
+
+STEP 6 — Output
+Print ranked table (best first) + detail cards + Telegram message.
+Summary Table
+RANK | TICKER | PRICE   | % TODAY | RSI | VOL RATIO | SCORE | CATALYST
+
+  1  | MU     | $98.40  |  +4.2%  |  62 |    2.8x   |  88   | AI chip demand surge
+
+  2  | NVDA   | $127.10 |  +2.8%  |  59 |    2.1x   |  79   | Analyst upgrade PT $150
+
+  3  | PLTR   | $24.80  |  +3.1%  |  64 |    1.9x   |  74   | Govt contract news
+Detail Card (per stock)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ #1  MU  —  Micron Technology
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ Price:        $98.40     Score: 88/100
+
+ Entry zone:   $98.40 – $98.60
+
+ Stop loss:    $96.20  (ATR-based, -2.2%)
+
+ Target:       $102.80 (2:1 R/R, +4.4%)
+
+ RSI:          62        Vol ratio: 2.8x
+
+ Above 9 EMA:  ✅        Above VWAP: ✅
+
+ Above 20 EMA: ✅        Sector (SOXX): ✅ green
+
+ Catalyst: AI chip demand surge — analysts
+
+ cite strong HBM memory orders from NVIDIA.
+
+ Morgan Stanley raised PT to $115 today.
+
+ Confidence: HIGH
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Telegram Message Format
+🔍 MORNING SCAN — [DATE] [TIME] EST
+
+📈 TOP PICKS TODAY:
+
+1️⃣ MU $98.40 (+4.2%) Score: 88
+
+   Entry: $98.40–$98.60
+
+   Stop:  $96.20 | Target: $102.80
+
+   📰 AI chip demand + MS upgrade
+
+2️⃣ NVDA $127.10 (+2.8%) Score: 79
+
+   Entry: $127.10–$127.35
+
+   Stop:  $124.80 | Target: $131.70
+
+   📰 Analyst upgrade PT $150
+
+Reply YES [TICKER] to approve a trade.
+
+Example: YES MU
+
+⚠️ Paper trading mode active.
+
+
+Safety Rules & Circuit Breakers
+Check before every scan and every poll cycle:
+
+MAX_POSITIONS     = 2       Never hold more than 2 stocks simultaneously
+
+MAX_POSITION_SIZE = $500    Per trade cap (paper trading phase)
+
+DAILY_LOSS_LIMIT  = $200    If hit → alert sent, no new trades rest of day
+
+SPY_CIRCUIT       = -1.5%   SPY drops 1.5%+ from open → exit ALL positions immediately
+
+RSI_EXIT          = 72      RSI crosses 72 while in position → exit signal
+
+HOLD_MAX          = 2 days  Force exit at market close on day 2, no exceptions
+
+MIN_SCORE         = 65      Never recommend a stock scoring below 65/100
+
+NO_CHASE          = +8%     Skip any stock already up 8%+ on the day
+
+
+Scan Schedule
+Time (EST)
+Action
+9:15 AM
+Pre-market scan — gap ups, pre-market volume leaders via Finnhub
+9:45 AM
+Post-open confirmation — who held their move after open chaos
+Every 30 min (10AM–3:30PM)
+Poll open positions, check exit signals
+3:45 PM
+EOD check — exit day-1 position if target/stop not hit and signal weakening
+
+
+
+File Structure (implementation reference)
+trading-bot/
+
+├── SKILL.md              ← this file (strategy blueprint)
+
+├── config.py             ← API keys, constants, universe lists, circuit breakers
+
+├── db.py                 ← Supabase client + all DB operations (log_scan, open_trade, close_trade, bot_state)
+
+├── scanner.py            ← Finnhub movers + hard filter logic
+
+├── enricher.py           ← Alpaca OHLCV + pandas-ta indicators (EMA, RSI, ATR, VWAP)
+
+├── scorer.py             ← scoring formula + disqualifier logic
+
+├── validator.py          ← Finnhub news + web search catalyst check
+
+├── alpaca_client.py      ← real-time quotes + paper order placement
+
+├── telegram_bot.py       ← notifications + YES/NO approval flow + /stats command
+
+├── monitor.py            ← 30-min polling, exit signal detection, circuit breakers
+
+├── eod_job.py            ← EOD: fill price_1day_later, price_2days_later, write daily_summary
+
+├── scheduler.py          ← APScheduler entry point (Railway deployment)
+
+└── main.py               ← orchestrator tying all modules together
+Key Dependencies
+alpaca-py           # Alpaca SDK (newer, preferred over alpaca-trade-api)
+
+finnhub-python      # official Finnhub client
+
+pandas-ta           # all technical indicators
+
+supabase            # Supabase Python client
+
+python-telegram-bot # Telegram notifications + command handling
+
+APScheduler         # job scheduling (Railway)
+
+pandas              # data manipulation
+
+
+Phase Rollout
+Phase 1 (now):   Paper trading, semi-auto
+
+                 Bot scans → Telegram alert → YOU approve → bot monitors exits
+
+Phase 2 (later): Paper trading, full-auto
+
+                 Only after 20+ trades validate signal accuracy
+
+Phase 3 (later): Live trading, small size ($200–500/trade)
+
+                 Only after Phase 2 proves profitable over 4+ consecutive weeks
+
+
+Deployment (Railway)
+Railway server runs 24/7 — no cold start issues
+APScheduler runs inside the Python process (no cron needed)
+Set environment variables in Railway dashboard (never hardcode keys):
+
+ALPACA_API_KEY
+
+ALPACA_SECRET_KEY
+
+ALPACA_BASE_URL     = https://paper-api.alpaca.markets
+
+FINNHUB_API_KEY
+
+TELEGRAM_BOT_TOKEN
+
+TELEGRAM_CHAT_ID
+
+SUPABASE_URL
+
+SUPABASE_ANON_KEY
+
+Single entry point: python main.py
+
+
+Trading Notes & Reminders
+Never chase: price already up 8%+ before entry → skip it, next opportunity coming
+Catalyst matters: stock moving with no news = higher risk, lower conviction
+Sector confirms: lone stock moving vs whole sector moving = very different confidence
+Open bell chaos: first 15 min (9:30–9:45) full of fake breakouts — wait for 9:45 scan
+VWAP reclaim: stock dips below VWAP then reclaims it = strong long signal, bonus entry
+Volume tells truth: price can be manipulated, volume cannot — always check vol ratio first
+RSI divergence warning: price making new high but RSI falling = momentum fading, be careful
