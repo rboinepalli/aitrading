@@ -36,8 +36,8 @@ PHASE = os.environ.get("TRADING_PHASE", "paper")   # "paper" or "live"
 # Circuit breakers
 # ---------------------------------------------------------------------------
 MAX_POSITIONS      = int(os.environ.get("MAX_POSITIONS", 2))
-MAX_POSITION_SIZE  = float(os.environ.get("MAX_POSITION_SIZE", 500))   # $ per trade
-DAILY_LOSS_LIMIT   = float(os.environ.get("DAILY_LOSS_LIMIT", 200))    # $ daily stop
+MAX_POSITION_SIZE  = float(os.environ.get("MAX_POSITION_USD", os.environ.get("MAX_POSITION_SIZE", 500)))   # $ per trade
+DAILY_LOSS_LIMIT   = float(os.environ.get("MAX_DAILY_LOSS_USD", os.environ.get("DAILY_LOSS_LIMIT", 200)))  # $ daily stop
 SPY_CIRCUIT_PCT    = float(os.environ.get("SPY_CIRCUIT_PCT", -1.5))    # % drop triggers halt
 RSI_EXIT_THRESHOLD = float(os.environ.get("RSI_EXIT_THRESHOLD", 72))   # exit if RSI > this
 HOLD_MAX_DAYS      = int(os.environ.get("HOLD_MAX_DAYS", 2))           # force exit after N days
