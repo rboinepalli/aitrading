@@ -219,13 +219,22 @@ def start_listener() -> None:
 
     def _run_app():
         global _app
+
+        async def _start():
+            global _app
+            _app = Application.builder().token(TELEGRAM_TOKEN).build()
+            _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message))
+            _app.add_handler(CommandHandler("stats",     lambda u, c: _send_stats(u)))
+            _app.add_handler(CommandHandler("positions", lambda u, c: _send_positions(u)))
+            await _app.initialize()
+            await _app.start()
+            await _app.updater.start_polling(drop_pending_updates=True)
+            # Block forever — thread exits when daemon is killed
+            await asyncio.Event().wait()
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        _app = Application.builder().token(TELEGRAM_TOKEN).build()
-        _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message))
-        _app.add_handler(CommandHandler("stats",     lambda u, c: _send_stats(u)))
-        _app.add_handler(CommandHandler("positions", lambda u, c: _send_positions(u)))
-        loop.run_until_complete(_app.run_polling(drop_pending_updates=True))
+        loop.run_until_complete(_start())
 
     t = threading.Thread(target=_run_app, daemon=True)
     t.start()

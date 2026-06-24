@@ -69,13 +69,9 @@ def run_screen() -> list[str]:
             else:
                 logger.debug("  ✗ %s — %s", ticker, reason)
 
-    # --- Tier 2: Finnhub top gainers (catches breakouts outside core list) ---
+    # --- Tier 2: broader liquid universe (catches breakouts outside core list) ---
     logger.info("Screening Tier 2 Finnhub gainers...")
     try:
-        movers = _fh.stock_market_status()   # check market is open first
-        # Fetch US stock symbols and find top movers by checking quotes
-        # Finnhub free tier doesn't have a dedicated top-gainers endpoint,
-        # so we check a broader set of liquid US tickers
         tier2_universe = [
             "RIVN", "LCID", "F", "GM", "NIO", "UBER", "LYFT", "SNAP", "PINS",
             "RBLX", "HOOD", "DKNG", "PENN", "CRWD", "PANW", "OKTA", "ZS",
