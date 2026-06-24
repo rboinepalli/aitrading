@@ -1,5 +1,4 @@
 import { useDailySummary } from '../hooks/useDailySummary'
-import { format } from 'date-fns'
 
 export function DailySummary() {
   const { data: rows, isLoading } = useDailySummary()
