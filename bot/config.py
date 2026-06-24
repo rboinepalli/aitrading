@@ -39,10 +39,13 @@ MAX_POSITIONS      = int(os.environ.get("MAX_POSITIONS", 2))
 MAX_POSITION_SIZE  = float(os.environ.get("MAX_POSITION_USD", os.environ.get("MAX_POSITION_SIZE", 500)))   # $ per trade
 DAILY_LOSS_LIMIT   = float(os.environ.get("MAX_DAILY_LOSS_USD", os.environ.get("DAILY_LOSS_LIMIT", 200)))  # $ daily stop
 SPY_CIRCUIT_PCT    = float(os.environ.get("SPY_CIRCUIT_PCT", -1.5))    # % drop triggers halt
-RSI_EXIT_THRESHOLD = float(os.environ.get("RSI_EXIT_THRESHOLD", 72))   # exit if RSI > this
+RSI_EXIT_THRESHOLD = float(os.environ.get("RSI_OVERBOUGHT", os.environ.get("RSI_EXIT_THRESHOLD", 72)))   # exit if RSI > this
+RSI_PERIOD         = int(os.environ.get("RSI_PERIOD", 14))
 HOLD_MAX_DAYS      = int(os.environ.get("HOLD_MAX_DAYS", 2))           # force exit after N days
 MIN_SCORE          = int(os.environ.get("MIN_SCORE", 65))              # min score to recommend
 NO_CHASE_PCT       = float(os.environ.get("NO_CHASE_PCT", 8.0))        # skip if already up 8%+
+STOP_LOSS_PCT      = float(os.environ.get("STOP_LOSS_PCT", 2.0))       # fallback stop % if ATR unavailable
+TAKE_PROFIT_PCT    = float(os.environ.get("TAKE_PROFIT_PCT", 4.0))     # fallback target % if ATR unavailable
 
 # ---------------------------------------------------------------------------
 # Stock universe — Tier 1: always scanned
