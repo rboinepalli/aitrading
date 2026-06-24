@@ -9,7 +9,7 @@ alpaca-py==0.34.0
 finnhub-python==2.4.20
 
 # Technical indicators — EMA, RSI, ATR, VWAP via pandas-ta
-pandas-ta==0.3.14b0
+pandas-ta
 
 # Telegram bot — trade alerts + YES/NO approval flow
 python-telegram-bot==21.6
