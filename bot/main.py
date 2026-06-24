@@ -140,10 +140,16 @@ def run_test() -> None:
 
 if __name__ == "__main__":
     # Manual run: python main.py scan | monitor | eod | test
+    # Add --no-telegram to skip the listener (avoids 409 conflict if Railway is also running)
     import sys
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "scan"
+    args = sys.argv[1:]
+    no_telegram = "--no-telegram" in args
+    cmd = next((a for a in args if not a.startswith("--")), "scan")
 
-    tg.start_listener()
+    if not no_telegram:
+        tg.start_listener()
+    else:
+        logger.info("Telegram listener skipped (--no-telegram)")
 
     if cmd == "scan":
         run_scan("MANUAL SCAN")

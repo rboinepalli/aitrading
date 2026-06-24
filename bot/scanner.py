@@ -5,6 +5,7 @@ Returns a deduplicated list of tickers that pass hard filters.
 Expected output: 10–25 candidates for the enricher.
 """
 import logging
+import time
 from typing import Optional
 
 import finnhub
@@ -61,6 +62,7 @@ def run_screen() -> list[str]:
     logger.info("Screening Tier 1 watchlist (%d tickers)...", len(TIER1_WATCHLIST))
     for ticker in TIER1_WATCHLIST:
         q = _quote(ticker)
+        time.sleep(0.12)   # ~8 req/s — Finnhub free tier allows 60/min
         if q:
             passes, reason = _passes_hard_filters(ticker, q)
             if passes:
@@ -82,6 +84,7 @@ def run_screen() -> list[str]:
             if ticker in candidates:
                 continue
             q = _quote(ticker)
+            time.sleep(0.12)
             if q:
                 passes, _ = _passes_hard_filters(ticker, q)
                 if passes:
